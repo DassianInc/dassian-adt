@@ -27,9 +27,9 @@ describeLive('abap_get_source (live)', () => {
   }, 15000);
 
   it('reads program source (PROG/P)', async () => {
-    // SAPLSAGG is a standard SAP program that exists on every system
+    // RSABAPPROGRAM is a standard SAP report that exists on every system
     const result = parseResult(await handlers.source.validateAndHandle('abap_get_source', {
-      name: 'SAPLSAGG', type: 'PROG/I'
+      name: 'RSABAPPROGRAM', type: 'PROG/P'
     }));
     expect(result.status).toBe('success');
     expect(typeof result.source).toBe('string');

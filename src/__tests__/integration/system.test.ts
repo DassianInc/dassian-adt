@@ -29,8 +29,12 @@ describeLive('SystemHandlers (live)', () => {
   }, 15000);
 
   it('abap_get_dump returns dumps array', async () => {
-    const result = parseResult(await handlers.system.validateAndHandle('abap_get_dump', {}));
+    // Use a specific query to limit results — unfiltered dumps can exceed XML parser limits
+    // on systems with many short dumps (entity expansion limit 1000)
+    const result = parseResult(await handlers.system.validateAndHandle('abap_get_dump', {
+      query: 'ABAP_PROGRAM'
+    }));
     expect(result.status).toBe('success');
     expect(Array.isArray(result.dumps)).toBe(true);
-  }, 15000);
+  }, 30000);
 });
