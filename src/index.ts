@@ -277,8 +277,15 @@ async function runHttp() {
     }
 
     // Existing pending session — user hasn't logged in yet.
-    // Return a clear JSON error directing them to the login page.
+    // Allow DELETE through so the MCP client can terminate the session cleanly
+    // (triggers onclose, which cleans up pendingSessions/sessionCredentials).
+    // All other methods get a 401 directing the user to the login page.
     if (sessionId && pendingSessions.has(sessionId)) {
+      if (req.method === 'DELETE') {
+        const pending = pendingSessions.get(sessionId)!;
+        await pending.transport.handleRequest(req, res);
+        return;
+      }
       const loginUrl = `/login?session=${encodeURIComponent(sessionId)}`;
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
