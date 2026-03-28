@@ -1,0 +1,80 @@
+{
+  "manifest_version": "0.2",
+  "name": "dassian-adt",
+  "version": "2.0.0",
+  "display_name": "Dassian ADT — SAP ABAP Development",
+  "description": "Connect Claude to SAP systems via ADT API. Read, write, test, and deploy ABAP code without SAP GUI.",
+  "author": {
+    "name": "Dassian Inc.",
+    "email": "pmcfarling@dassian.com",
+    "url": "https://github.com/DassianInc/dassian-adt"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/index.js"
+      ],
+      "env": {
+        "NODE_TLS_REJECT_UNAUTHORIZED": "0"
+      }
+    }
+  },
+  "user_config": {
+    "SAP_URL": {
+      "type": "string",
+      "title": "SAP System URL",
+      "description": "SAP system URL including port, e.g. https://d25app.dassian.org:44300",
+      "required": true
+    },
+    "SAP_USER": {
+      "type": "string",
+      "title": "SAP Username",
+      "description": "Your SAP user ID",
+      "required": true
+    },
+    "SAP_PASSWORD": {
+      "type": "string",
+      "title": "SAP Password",
+      "description": "Your SAP password",
+      "sensitive": true,
+      "required": true
+    },
+    "SAP_CLIENT": {
+      "type": "string",
+      "title": "SAP Client",
+      "description": "SAP client number (usually 100)",
+      "default": "100"
+    },
+    "SAP_LANGUAGE": {
+      "type": "string",
+      "title": "SAP Language",
+      "description": "SAP logon language",
+      "default": "EN"
+    }
+  },
+  "tools": [
+    { "name": "abap_get_source", "description": "Read ABAP source code" },
+    { "name": "abap_set_source", "description": "Write ABAP source code" },
+    { "name": "abap_create", "description": "Create ABAP objects" },
+    { "name": "abap_delete", "description": "Delete ABAP objects" },
+    { "name": "abap_activate", "description": "Activate ABAP objects" },
+    { "name": "abap_search", "description": "Search for ABAP objects" },
+    { "name": "abap_run", "description": "Run ABAP code and capture output" },
+    { "name": "abap_table", "description": "Read SAP tables and CDS views" },
+    { "name": "abap_query", "description": "Execute SQL queries" },
+    { "name": "transport_create", "description": "Create transport requests" },
+    { "name": "transport_release", "description": "Release transports" },
+    { "name": "abap_syntax_check", "description": "Check ABAP syntax" },
+    { "name": "abap_atc_run", "description": "Run ATC quality checks" }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "license": "MIT"
+}

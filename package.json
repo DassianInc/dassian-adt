@@ -1,7 +1,7 @@
 {
   "name": "dassian-adt",
   "version": "2.0.0",
-  "description": "Production-grade MCP server for SAP ABAP development via ADT API. AI-assisted ABAP: read, write, test, and deploy code without touching SAP GUI.",
+  "description": "MCP server for SAP ABAP development via ADT API. Connect AI assistants to SAP: read, write, test, and deploy ABAP code without SAP GUI.",
   "main": "dist/index.js",
   "scripts": {
     "test": "jest --testPathPattern='__tests__/unit'",

@@ -1,8 +1,8 @@
 # dassian-adt
 
-Production-grade MCP server for SAP ABAP development via the ADT API. Connect any AI assistant (Claude, ChatGPT, Copilot) to your SAP system and let it read, write, test, and deploy ABAP code.
+MCP server for SAP ABAP development via the ADT API. Connect AI assistants to your SAP system — read, write, test, and deploy ABAP code without SAP GUI.
 
-Built for real-world use by non-technical users. Zero crashes on bad input. Self-correcting error messages. Interactive prompts when the AI doesn't have enough information.
+Built for real-world use. Handles bad input gracefully, gives actionable error messages, and prompts for missing information instead of crashing.
 
 ## Origins
 
