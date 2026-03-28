@@ -6,9 +6,9 @@ The AI can create objects, write source, activate, manage transports, run code, 
 
 ## Origins
 
-This project is a v2.0 rewrite of [mcp-abap-abap-adt-api](https://github.com/mario-andreschak/mcp-abap-abap-adt-api) by **[Mario Andreschak](https://github.com/mario-andreschak)**, which provided the original MCP server scaffold for SAP ADT integration. The underlying ADT HTTP communication is powered by **[Marcello Urbani](https://github.com/marcellourbani)**'s [abap-adt-api](https://github.com/marcellourbani/abap-adt-api) library.
+Based on [mcp-abap-abap-adt-api](https://github.com/mario-andreschak/mcp-abap-abap-adt-api) by **[Mario Andreschak](https://github.com/mario-andreschak)** and the [abap-adt-api](https://github.com/marcellourbani/abap-adt-api) library by **[Marcello Urbani](https://github.com/marcellourbani)**.
 
-Dassian's rewrite adds production hardening, input validation, error intelligence, MCP elicitation, session recovery, and a full test suite. See [CHANGES.md](CHANGES.md) for the complete list.
+Dassian's fork adds input validation, error intelligence, MCP elicitation, session recovery, and a test suite. See [CHANGES.md](CHANGES.md) for the full list.
 
 ## What It Does
 
@@ -219,7 +219,7 @@ Contributions are welcome. Please:
 
 - **[Mario Andreschak](https://github.com/mario-andreschak)** -- original [mcp-abap-abap-adt-api](https://github.com/mario-andreschak/mcp-abap-abap-adt-api) server scaffold
 - **[Marcello Urbani](https://github.com/marcellourbani)** -- [abap-adt-api](https://github.com/marcellourbani/abap-adt-api) library powering all ADT HTTP communication
-- **[Dassian Inc.](https://github.com/DassianInc)** -- v2.0 production rewrite
+- **[Dassian Inc.](https://github.com/DassianInc)** -- fork maintainer
 
 ## License
 

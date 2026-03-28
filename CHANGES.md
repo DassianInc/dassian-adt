@@ -1,6 +1,6 @@
-# What Changed — v2.0 Rewrite
+# What Changed
 
-The original MCP server by Mario Andreschak was a proof of concept — it connected to ADT and exposed tools. It worked if you knew exactly what to pass and nothing went wrong. This rewrite assumes the caller is an AI model that will get things wrong constantly, and a human user who shouldn't have to care about ADT internals.
+Based on the original MCP server by Mario Andreschak. This fork focuses on letting the AI do real development work — not just read code, but write it, activate it, manage transports, and clean up after itself. The changes below address what broke when we started using it that way.
 
 ## Crash elimination
 
@@ -71,10 +71,10 @@ The library's `runQuery()` omits `Content-Type`, causing 400 on all systems. We 
 
 ## What didn't change
 
-The `abap-adt-api` library by Marcello Urbani. The MCP SDK. The basic handler architecture (BaseHandler → subclass per domain). We built on what worked and fixed what broke in production.
+The `abap-adt-api` library by Marcello Urbani. The MCP SDK. The basic handler architecture (BaseHandler → subclass per domain). We built on what worked and fixed what broke in real use.
 
 ## Credits
 
 - **Mario Andreschak** — original MCP server scaffold
 - **Marcello Urbani** — `abap-adt-api` library (the ADT HTTP client underneath everything)
-- **Dassian Inc.** — production hardening, elicitation, test suite, error intelligence
+- **Dassian Inc.** — validation, elicitation, error handling, test suite
