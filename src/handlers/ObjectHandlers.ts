@@ -67,13 +67,14 @@ export class ObjectHandlers extends BaseHandler {
       {
         name: 'abap_search',
         description:
-          'Search for ABAP objects by name pattern. Supports wildcards (*). ' +
-          'Returns object names, types, and ADT URLs. ' +
-          'To find a specific object, use the exact name. To browse, use wildcards like /DSN/BIL_*.',
+          'Search for ABAP objects by name pattern. Returns object names, types, and ADT URLs. ' +
+          'IMPORTANT: Only TRAILING wildcards work. Use "/DSN/BIL*" not "/DSN/*BIL*". ' +
+          'Leading wildcards (*SOMETHING) and mid-name wildcards (/DSN/*FOO*BAR*) will fail. ' +
+          'If you need to find an object by partial name, put the known prefix first: /DSN/BIL*.',
         inputSchema: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: 'Search string. Wildcards (*) supported. E.g. ZCL_MY_* or /DSN/BIL_*' },
+            query: { type: 'string', description: 'Search string. Only trailing wildcards (*) work. E.g. ZCL_MY_* or /DSN/BIL*. Leading wildcards like *BILL* will fail.' },
             type: { type: 'string', description: `Filter by object type. ${SUPPORTED}. Omit to search all types.` },
             max: { type: 'number', description: 'Max results (default 50)' }
           },
@@ -311,18 +312,69 @@ export class ObjectHandlers extends BaseHandler {
     }
   }
 
+  /**
+   * Sanitize search query for SAP ADT quick search.
+   * SAP only supports trailing wildcards (e.g. /DSN/BIL*).
+   * Leading wildcards (*BILL*) and multi-wildcards (/DSN/*FOO*BAR*) return 400.
+   * This method rewrites bad patterns into valid ones and returns a warning.
+   */
+  private sanitizeSearchQuery(query: string): { query: string; warning?: string } {
+    if (!query) return { query };
+    const original = query;
+
+    // Pattern: *SOMETHING or *SOMETHING* (leading wildcard, no namespace)
+    // e.g. *SF1403* → SF1403*
+    if (query.startsWith('*')) {
+      query = query.replace(/^\*+/, '').replace(/\*+$/, '') + '*';
+      return {
+        query,
+        warning: `Rewrote "${original}" → "${query}" (SAP ADT only supports trailing wildcards)`
+      };
+    }
+
+    // Pattern: /NS/*SOMETHING* (namespace + leading wildcard in name part)
+    // e.g. /DSN/*BILL* → /DSN/BILL*
+    // e.g. /VNO/*FORM* → /VNO/FORM*
+    const nsMatch = query.match(/^(\/[^/]+\/)\*(.+)$/);
+    if (nsMatch) {
+      const ns = nsMatch[1];
+      const rest = nsMatch[2].replace(/\*+$/, '') + '*';
+      query = ns + rest;
+      return {
+        query,
+        warning: `Rewrote "${original}" → "${query}" (SAP ADT only supports trailing wildcards)`
+      };
+    }
+
+    // Pattern: multiple wildcards in the name e.g. /DSN/FOO*BAR*
+    const wildcardCount = (query.match(/\*/g) || []).length;
+    if (wildcardCount > 1) {
+      // Keep everything up to the first wildcard
+      const firstStar = query.indexOf('*');
+      query = query.substring(0, firstStar + 1);
+      return {
+        query,
+        warning: `Rewrote "${original}" → "${query}" (SAP ADT does not support multiple wildcards)`
+      };
+    }
+
+    return { query };
+  }
+
   private async handleSearch(args: any): Promise<any> {
+    const { query, warning } = this.sanitizeSearchQuery(args.query);
     try {
       const results = await this.withSession(() =>
-        this.adtclient.searchObject(args.query, args.type, args.max || 50)
+        this.adtclient.searchObject(query, args.type, args.max || 50)
       );
       const count = Array.isArray(results) ? results.length : 0;
-      const hint = count === 0 && args.query && !args.query.includes('*')
-        ? ` No results — try adding a wildcard, e.g. "${args.query}*"`
+      const hint = count === 0 && query && !query.includes('*')
+        ? ` No results — try adding a wildcard, e.g. "${query}*"`
         : undefined;
-      return this.success({ results, count, ...(hint ? { hint } : {}) });
+      return this.success({ results, count, ...(warning ? { warning } : {}), ...(hint ? { hint } : {}) });
     } catch (error: any) {
-      this.fail(formatError(`abap_search(${args.query})`, error));
+      this.fail(formatError(`abap_search(${query})`, error) +
+        (warning ? ` (original query "${args.query}" was rewritten to "${query}")` : ''));
     }
   }
 

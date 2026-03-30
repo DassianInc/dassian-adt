@@ -107,8 +107,8 @@ export class QualityHandlers extends BaseHandler {
         this.adtclient.usageReferences(objectUrl, args.line, args.column)
       );
 
-      // Filter to actual results (isResult=true), not grouping nodes
-      const results = references.filter(r => r.isResult);
+      // Use all references — isResult flag is unreliable across SAP versions
+      const results = references;
 
       // Build a clean summary for each reference
       const summary = results.map(r => ({
@@ -125,7 +125,7 @@ export class QualityHandlers extends BaseHandler {
       let snippets: any[] | undefined;
       if (args.snippets && results.length > 0) {
         const rawSnippets = await this.withSession(() =>
-          this.adtclient.usageReferenceSnippets(results)
+          this.adtclient.usageReferenceSnippets(references)
         );
         snippets = rawSnippets.map(s => ({
           objectIdentifier: s.objectIdentifier,
