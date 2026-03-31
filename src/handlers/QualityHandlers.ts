@@ -157,27 +157,49 @@ export class QualityHandlers extends BaseHandler {
     const objectUrl = buildObjectUrl(args.name, args.type);
     const variant = args.variant || 'DEFAULT';
     try {
-      // Run a fresh ATC check: createAtcRun triggers the check and returns a run result ID,
-      // then atcWorklists fetches the actual findings for that run.
-      const runResult = await this.withSession(() =>
-        this.adtclient.createAtcRun(variant, objectUrl)
+      // Step 1: Resolve variant name to internal worklist ID.
+      // Passing the variant name string directly to createAtcRun causes a silent fallback to DEFAULT.
+      const worklistId = await this.withSession(() =>
+        this.adtclient.atcCheckVariant(variant)
       );
 
-      const worklistId = runResult?.id;
-      if (!worklistId) {
-        return this.success({
-          name: args.name,
-          variant,
-          findings: runResult,
-          hint: 'ATC run completed but returned no worklist ID. The run result is included as-is.'
-        });
+      // Step 2: Trigger a fresh ATC run using the resolved ID.
+      const runResult = await this.withSession(() =>
+        this.adtclient.createAtcRun(worklistId, objectUrl, 100)
+      );
+
+      // Step 3: Fetch findings using run ID + timestamp.
+      const worklist = await this.withSession(() =>
+        this.adtclient.atcWorklists(runResult.id, runResult.timestamp, '', false)
+      );
+
+      // Group findings by priority: 1=error, 2=warning, else=info
+      const grouped: { error: any[]; warning: any[]; info: any[] } = { error: [], warning: [], info: [] };
+      let totalFindings = 0;
+      for (const obj of (worklist.objects || [])) {
+        for (const f of (obj.findings || [])) {
+          totalFindings++;
+          const finding = {
+            object: obj.name,
+            objectType: obj.type,
+            checkId: f.checkId,
+            checkTitle: f.checkTitle,
+            messageTitle: f.messageTitle,
+            priority: f.priority,
+            location: f.location ? {
+              uri: f.location.uri,
+              line: f.location.range ? f.location.range.start.line : undefined,
+              column: f.location.range ? f.location.range.start.column : undefined
+            } : undefined,
+            exemptionKind: f.exemptionKind || ''
+          };
+          if (f.priority === 1) grouped.error.push(finding);
+          else if (f.priority === 2) grouped.warning.push(finding);
+          else grouped.info.push(finding);
+        }
       }
 
-      const worklist = await this.withSession(() =>
-        this.adtclient.atcWorklists(worklistId)
-      );
-
-      return this.success({ name: args.name, variant, findings: worklist });
+      return this.success({ name: args.name, variant, runId: runResult.id, findings: grouped, totalFindings });
     } catch (error: any) {
       this.fail(formatError(`abap_atc_run(${args.name})`, error));
     }
