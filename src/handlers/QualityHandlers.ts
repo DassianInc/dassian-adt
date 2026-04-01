@@ -74,16 +74,37 @@ export class QualityHandlers extends BaseHandler {
           },
           required: ['name', 'type']
         }
+      },
+      {
+        name: 'abap_find_definition',
+        description:
+          'Jump to the definition of an ABAP symbol at a specific source position. ' +
+          'Given a source object and a line/column, returns the object and line where that symbol is defined. ' +
+          'Equivalent to F3 / Ctrl+Click in Eclipse ADT. ' +
+          'Use this to navigate from a method call to its implementation, or from a type usage to its definition.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name:   { type: 'string',  description: 'Object name containing the symbol, e.g. /DSN/CL_S4CM_CMB_CONTRACT' },
+            type:   { type: 'string',  description: 'Object type, e.g. CLAS, PROG/I' },
+            line:   { type: 'number',  description: 'Line number (1-based) of the symbol in the source' },
+            column: { type: 'number',  description: 'Column number (1-based) of the symbol start' },
+            end_column: { type: 'number', description: 'Column number of the symbol end (inclusive). Defaults to column+1 if omitted.' },
+            implementation: { type: 'boolean', description: 'If true, jump to the implementation rather than the declaration (default: false)' }
+          },
+          required: ['name', 'type', 'line', 'column']
+        }
       }
     ];
   }
 
   async handle(toolName: string, args: any): Promise<any> {
     switch (toolName) {
-      case 'abap_syntax_check':  return this.handleSyntaxCheck(args);
-      case 'abap_atc_run':       return this.handleAtcRun(args);
-      case 'abap_atc_variants':  return this.handleAtcVariants(args);
-      case 'abap_where_used':    return this.handleWhereUsed(args);
+      case 'abap_syntax_check':    return this.handleSyntaxCheck(args);
+      case 'abap_atc_run':         return this.handleAtcRun(args);
+      case 'abap_atc_variants':    return this.handleAtcVariants(args);
+      case 'abap_where_used':      return this.handleWhereUsed(args);
+      case 'abap_find_definition': return this.handleFindDefinition(args);
       default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
   }
@@ -324,6 +345,35 @@ export class QualityHandlers extends BaseHandler {
       });
     } catch (error: any) {
       this.fail(formatError('abap_atc_variants', error));
+    }
+  }
+
+  private async handleFindDefinition(args: any): Promise<any> {
+    try {
+      const sourceUrl = buildSourceUrl(args.name, args.type);
+      const source = await this.withSession(() =>
+        this.adtclient.getObjectSource(sourceUrl)
+      ) as string;
+
+      const startCol = args.column;
+      const endCol = args.end_column ?? args.column + 1;
+      const implementation = args.implementation ?? false;
+
+      const location = await this.withSession(() =>
+        this.adtclient.findDefinition(sourceUrl, source, args.line, startCol, endCol, implementation)
+      );
+
+      return this.success({
+        name: args.name,
+        type: args.type,
+        definition: {
+          uri: location.url,
+          line: location.line,
+          column: location.column
+        }
+      });
+    } catch (error: any) {
+      this.fail(formatError(`abap_find_definition(${args.name})`, error));
     }
   }
 }
