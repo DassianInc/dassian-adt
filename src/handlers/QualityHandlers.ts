@@ -181,21 +181,33 @@ export class QualityHandlers extends BaseHandler {
       );
 
       // Step 1b: Fallback detection — if a non-DEFAULT variant was requested,
-      // also probe DEFAULT and compare IDs. Same ID = SAP silently fell back.
-      let variantWarning: string | undefined;
+      // probe DEFAULT and compare IDs. Same ID = SAP silently fell back.
+      // Intercept BEFORE running so results aren't silently from the wrong variant.
+      let resolvedVariant = variant;
       if (variant !== 'DEFAULT') {
         try {
           const defaultWorklistId = await this.withSession(() =>
             this.adtclient.atcCheckVariant('DEFAULT')
           );
           if (worklistId === defaultWorklistId) {
-            variantWarning =
-              `Variant "${variant}" resolved to the same worklist ID as DEFAULT (${worklistId}). ` +
-              `SAP silently fell back — the variant name may not exist in SATC. ` +
-              `Check SATC transaction to confirm the exact variant name (case-sensitive).`;
+            const choice = await this.elicitChoice(
+              `Variant "${variant}" was not found in SATC — SAP would silently run DEFAULT instead.\n` +
+              `Proceed with DEFAULT, or cancel and fix the variant name (check SATC, names are case-sensitive)?`,
+              'action',
+              ['Proceed with DEFAULT', 'Cancel'],
+              'Cancel'
+            );
+            if (!choice || choice === 'Cancel') {
+              this.fail(
+                `abap_atc_run cancelled: variant "${variant}" does not exist in SATC. ` +
+                `Use abap_atc_variants with probe_variant to test names, or check SATC transaction directly.`
+              );
+            }
+            resolvedVariant = 'DEFAULT';
           }
-        } catch (_) {
-          // Non-fatal — don't block the ATC run if fallback probe fails
+        } catch (e: any) {
+          // If the probe itself throws (e.g. elicitation not supported), proceed as before
+          if (e.message?.includes('cancelled')) throw e;
         }
       }
 
@@ -237,12 +249,12 @@ export class QualityHandlers extends BaseHandler {
 
       return this.success({
         name: args.name,
-        variant,
+        variant: resolvedVariant,
+        requestedVariant: variant !== resolvedVariant ? variant : undefined,
         worklistId,
         runId: runResult.id,
         findings: grouped,
-        totalFindings,
-        ...(variantWarning ? { variantWarning } : {})
+        totalFindings
       });
     } catch (error: any) {
       this.fail(formatError(`abap_atc_run(${args.name})`, error));

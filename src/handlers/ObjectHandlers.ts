@@ -368,17 +368,80 @@ export class ObjectHandlers extends BaseHandler {
 
       if (result && !result.success) {
         const errorText = formatActivationMessages(result.messages || []);
-        return this.success({
-          activated: false,
-          objectCount: inactiveObjects.length,
-          errors: errorText
-        });
+
+        // Offer to retry each object individually to isolate which one(s) are failing
+        const choice = await this.elicitChoice(
+          `Batch activation failed for ${inactiveObjects.length} object(s).\n${errorText}\n\n` +
+          `Retry each object individually to find which one(s) are causing the failure?`,
+          'action',
+          ['Retry individually', 'Abort'],
+          'Retry individually'
+        );
+
+        if (choice === 'Retry individually') {
+          const passed: string[] = [];
+          const failed: Array<{ name: string; error: string }> = [];
+          for (const obj of inactiveObjects) {
+            try {
+              const r = await this.withSession(() =>
+                this.adtclient.activate(obj)
+              );
+              if (r && !r.success) {
+                failed.push({ name: obj['adtcore:name'], error: formatActivationMessages(r.messages || []) });
+              } else {
+                passed.push(obj['adtcore:name']);
+              }
+            } catch (e: any) {
+              failed.push({ name: obj['adtcore:name'], error: e.message });
+            }
+          }
+          return this.success({
+            activated: failed.length === 0,
+            mode: 'individual_retry',
+            passed,
+            failed
+          });
+        }
+
+        this.fail(`abap_activate_batch: activation failed.\n${errorText}`);
       }
 
       const inactive = result?.inactive || [];
       const inactiveNames = inactive
         .map((i: any) => i.object?.['adtcore:name'])
         .filter(Boolean);
+
+      // Offer to activate still-inactive dependents
+      if (inactiveNames.length > 0) {
+        const activateDeps = await this.confirmWithUser(
+          `${inactiveObjects.length} object(s) activated. ` +
+          `${inactiveNames.length} dependent(s) are still inactive: ${inactiveNames.join(', ')}. Activate them too?`,
+          { dependents: inactiveNames.join(', ') }
+        );
+        if (activateDeps) {
+          const activatedDeps: string[] = [];
+          const failedDeps: string[] = [];
+          for (const dep of inactive) {
+            const depName = dep.object?.['adtcore:name'];
+            const depUrl = dep.object?.['adtcore:uri'];
+            if (depName && depUrl) {
+              try {
+                await this.withSession(() => this.adtclient.activate(depName, depUrl));
+                activatedDeps.push(depName);
+              } catch (_) {
+                failedDeps.push(depName);
+              }
+            }
+          }
+          return this.success({
+            activated: true,
+            objectCount: inactiveObjects.length,
+            objects: args.objects.map((o: any) => o.name),
+            dependentsActivated: activatedDeps,
+            dependentsFailed: failedDeps.length > 0 ? failedDeps : undefined
+          });
+        }
+      }
 
       return this.success({
         activated: true,
