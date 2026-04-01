@@ -34,6 +34,7 @@ export class ObjectHandlers extends BaseHandler {
       },
       {
         name: 'abap_delete',
+        annotations: { destructiveHint: true },
         description:
           'Delete an ABAP object. Locks the object, deletes it, and the lock is released implicitly by the delete. ' +
           'For objects in a transport, provide the transport number.',
@@ -49,6 +50,7 @@ export class ObjectHandlers extends BaseHandler {
       },
       {
         name: 'abap_activate',
+        annotations: { idempotentHint: true },
         description:
           'Activate an ABAP object, making it the active version. ' +
           'Must be called after abap_set_source or abap_create. ' +
@@ -67,6 +69,7 @@ export class ObjectHandlers extends BaseHandler {
       },
       {
         name: 'abap_search',
+        annotations: { readOnlyHint: true },
         description:
           'Search for ABAP objects by name pattern. Returns object names, types, and ADT URLs. ' +
           'IMPORTANT: Only TRAILING wildcards work. Use "/DSN/BIL*" not "/DSN/*BIL*". ' +
@@ -84,6 +87,7 @@ export class ObjectHandlers extends BaseHandler {
       },
       {
         name: 'abap_activate_batch',
+        annotations: { idempotentHint: true },
         description:
           'Activate multiple ABAP objects in a single ADT request. ' +
           'More efficient than calling abap_activate repeatedly for each object. ' +
@@ -102,6 +106,7 @@ export class ObjectHandlers extends BaseHandler {
       },
       {
         name: 'abap_object_info',
+        annotations: { readOnlyHint: true },
         description:
           'Get metadata for an ABAP object: package, transport layer, active/inactive status, ' +
           'upgrade flag (upgradeFlag=true means object is in SPAU adjustment mode and cannot be edited via ADT), ' +
@@ -252,6 +257,7 @@ export class ObjectHandlers extends BaseHandler {
     }
 
     try {
+      await this.notify(`Activating ${activateName}…`);
       const result = await this.withSession(() =>
         this.adtclient.activate(activateName, objectUrl)
       );
@@ -362,6 +368,7 @@ export class ObjectHandlers extends BaseHandler {
         };
       });
 
+      await this.notify(`Activating ${inactiveObjects.length} object(s)…`);
       const result = await this.withSession(() =>
         this.adtclient.activate(inactiveObjects)
       );

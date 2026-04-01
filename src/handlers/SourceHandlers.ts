@@ -11,6 +11,7 @@ export class SourceHandlers extends BaseHandler {
     return [
       {
         name: 'abap_get_source',
+        annotations: { readOnlyHint: true },
         description:
           'Get the ABAP source code for any object by name and type. ' +
           'No URL construction needed — just provide the object name and type. ' +
@@ -42,6 +43,7 @@ export class SourceHandlers extends BaseHandler {
       },
       {
         name: 'abap_set_source',
+        annotations: { idempotentHint: true },
         description:
           'Write ABAP source code for an object. Handles lock → write → unlock automatically. ' +
           'For objects outside $TMP, provide a transport number. ' +
@@ -75,6 +77,7 @@ export class SourceHandlers extends BaseHandler {
       },
       {
         name: 'abap_edit_method',
+        annotations: { idempotentHint: true },
         description:
           'Surgically edit a single method inside an ABAP class without touching the rest of the source. ' +
           'Finds the method boundaries, does a find/replace scoped only to that method body, ' +
@@ -96,6 +99,7 @@ export class SourceHandlers extends BaseHandler {
       },
       {
         name: 'abap_get_function_group',
+        annotations: { readOnlyHint: true },
         description:
           'Get all source for a function group in one call: top include, all user includes (U01..UXX), ' +
           'and all function module sources. Returns a map of include/FM name → source. ' +
@@ -174,22 +178,40 @@ export class SourceHandlers extends BaseHandler {
     const startRe = new RegExp(`^([ \\t]*)METHOD\\s+${methodEscaped}\\s*\\.`, 'im');
     let startMatch = startRe.exec(source!);
     if (!startMatch) {
-      // Extract available method names from source to help the model pick the right one
+      // Extract available method names from source
       const methodNames: string[] = [];
       const listRe = /^\s*METHOD\s+(\S+)\s*\./gim;
       let m: RegExpExecArray | null;
       while ((m = listRe.exec(source!)) !== null) {
         methodNames.push(m[1]);
       }
+      const methodList = methodNames.slice(0, 30).join(', ') + (methodNames.length > 30 ? ` (+${methodNames.length - 30} more)` : '');
+
+      // Try sampling first — ask Claude which method was meant without interrupting the user
+      const sampledMethod = await this.askClaude(
+        'You are helping resolve an ambiguous ABAP method name. Respond with ONLY the exact method name from the list, nothing else.',
+        `The user requested METHOD "${method}" but it was not found in class ${name}.\nAvailable methods: ${methodList}\nWhich method did they most likely mean? Reply with only the method name.`,
+        50
+      );
+      if (sampledMethod?.trim()) {
+        const corrected = sampledMethod.trim().replace(/['"]/g, '');
+        // Verify the sampled answer actually exists
+        const verifyRe = new RegExp(`^\\s*METHOD\\s+${corrected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\.`, 'im');
+        if (verifyRe.test(source!)) {
+          args.method = corrected;
+          return this.handleEditMethod(args);
+        }
+      }
+
+      // Sampling unavailable or returned a bad answer — fall back to eliciting from the user
       const input = await this.elicitForm(
         `abap_edit_method: METHOD "${method}" not found in ${name}. ` +
-        `Available methods: ${methodNames.slice(0, 30).join(', ')}${methodNames.length > 30 ? ` (+${methodNames.length - 30} more)` : ''}. ` +
-        `Please provide the correct method name (case-insensitive).`,
+        `Available methods: ${methodList}. Please provide the correct method name.`,
         { method: { type: 'string', title: 'Method name', description: 'Correct method name from the list above' } },
         ['method']
       );
       if (!input?.method) {
-        this.fail(`abap_edit_method: METHOD "${method}" not found in ${name}. Available: ${methodNames.join(', ')}`);
+        this.fail(`abap_edit_method: METHOD "${method}" not found in ${name}. Available: ${methodList}`);
       }
       args.method = input!.method;
       return this.handleEditMethod(args);
@@ -256,6 +278,7 @@ export class SourceHandlers extends BaseHandler {
     }
 
     // Write back
+    await this.notify(`Writing updated METHOD ${method} to ${name}…`);
     let lockHandle: string | null = null;
     try {
       const lockResult = await this.withSession(() => this.adtclient.lock(objectUrl));

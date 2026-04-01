@@ -33,6 +33,7 @@ export class TransportHandlers extends BaseHandler {
       },
       {
         name: 'transport_assign',
+        annotations: { idempotentHint: true },
         description:
           'Assign an existing object to a transport request via no-op save ' +
           '(lock → read source → write same source with transport number → unlock). ' +
@@ -50,6 +51,7 @@ export class TransportHandlers extends BaseHandler {
       },
       {
         name: 'transport_release',
+        annotations: { destructiveHint: true },
         description:
           'Release a transport request. Automatically releases child tasks first, then the parent request. ' +
           'WARNING: Irreversible. Only call when explicitly asked to release. ' +
@@ -65,6 +67,7 @@ export class TransportHandlers extends BaseHandler {
       },
       {
         name: 'transport_list',
+        annotations: { readOnlyHint: true },
         description: 'List open transport requests for a user. Defaults to the current session user.',
         inputSchema: {
           type: 'object',
@@ -75,6 +78,7 @@ export class TransportHandlers extends BaseHandler {
       },
       {
         name: 'transport_info',
+        annotations: { readOnlyHint: true },
         description: 'Get the current transport assignment for an object.',
         inputSchema: {
           type: 'object',
@@ -87,6 +91,7 @@ export class TransportHandlers extends BaseHandler {
       },
       {
         name: 'transport_contents',
+        annotations: { readOnlyHint: true },
         description:
           'List all objects on a transport request (E071). ' +
           'Returns the PGMID, object type, and object name for every entry. ' +
@@ -214,6 +219,7 @@ export class TransportHandlers extends BaseHandler {
 
     try {
       try {
+        await this.notify(`Releasing ${args.transport}…`);
         const result = await this.withSession(() =>
           this.adtclient.transportRelease(args.transport, args.ignoreAtc || false)
         );
@@ -228,11 +234,13 @@ export class TransportHandlers extends BaseHandler {
 
           const tasks: string[] = (info?.tasks || []).map((t: any) => t.number || t).filter(Boolean);
           for (const task of tasks) {
+            await this.notify(`Releasing task ${task}…`);
             await this.withSession(() =>
               this.adtclient.transportRelease(task, args.ignoreAtc || false)
             );
           }
 
+          await this.notify(`Releasing request ${args.transport}…`);
           const result = await this.withSession(() =>
             this.adtclient.transportRelease(args.transport, args.ignoreAtc || false)
           );

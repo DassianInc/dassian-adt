@@ -9,10 +9,18 @@ import { NESTED_TYPES, encodeAbapName, buildFunctionModuleUrl } from '../lib/url
 /** Function signature matching Server.elicitInput — injected from AbapAdtServer. */
 export type ElicitFn = (params: any) => Promise<{ action: string; content?: Record<string, any> }>;
 
+/** Send a progress/status message visible in the Claude Code UI. */
+export type NotifyFn = (level: 'info' | 'warning' | 'error', message: string) => Promise<void>;
+
+/** Ask Claude to make a decision without interrupting the human. Returns Claude's text response. */
+export type SamplingFn = (systemPrompt: string, userMessage: string, maxTokens?: number) => Promise<string>;
+
 export abstract class BaseHandler {
   protected readonly adtclient: ADTClient;
   protected readonly logger = createLogger(this.constructor.name);
   private _elicit?: ElicitFn;
+  private _notify?: NotifyFn;
+  private _sampling?: SamplingFn;
 
   constructor(adtclient: ADTClient) {
     this.adtclient = adtclient;
@@ -21,6 +29,39 @@ export abstract class BaseHandler {
   /** Inject the server's elicitInput function after construction. */
   setElicit(fn: ElicitFn): void {
     this._elicit = fn;
+  }
+
+  /** Inject a progress notification function (sendLoggingMessage wrapper). */
+  setNotify(fn: NotifyFn): void {
+    this._notify = fn;
+  }
+
+  /** Inject a sampling function (server.createMessage wrapper). */
+  setSampling(fn: SamplingFn): void {
+    this._sampling = fn;
+  }
+
+  /**
+   * Send a progress/status message visible in Claude Code's UI during long operations.
+   * No-ops silently if logging capability is not available.
+   */
+  protected async notify(message: string, level: 'info' | 'warning' | 'error' = 'info'): Promise<void> {
+    if (this._notify) {
+      try { await this._notify(level, message); } catch (_) {}
+    }
+  }
+
+  /**
+   * Ask Claude to make a simple decision without interrupting the user.
+   * Falls back to returning null if sampling is not available — callers must handle null.
+   */
+  protected async askClaude(systemPrompt: string, userMessage: string, maxTokens = 200): Promise<string | null> {
+    if (!this._sampling) return null;
+    try {
+      return await this._sampling(systemPrompt, userMessage, maxTokens);
+    } catch (_) {
+      return null;
+    }
   }
 
   /**
@@ -117,16 +158,26 @@ export abstract class BaseHandler {
     } catch (error: any) {
       const info = parseAdtError(error);
       if (info.isSessionTimeout) {
-        this.logger.info('Session expired — re-logging in automatically');
+        this.logger.info('Session expired — clearing state and re-logging in');
+        await this.notify('SAP session expired — reconnecting…');
         try {
+          // Drop stale session state before re-login to avoid cookie conflicts
+          try { await this.adtclient.dropSession(); } catch (_) {}
           this.adtclient.stateful = session_types.stateful;
           await this.adtclient.login();
           return await fn();
         } catch (loginError: any) {
-          throw new McpError(
-            ErrorCode.InternalError,
-            `Session expired and re-login failed: ${loginError.message || 'Unknown error'}`
-          );
+          // One more attempt after a short pause (handles transient network blips)
+          await new Promise(r => setTimeout(r, 1500));
+          try {
+            await this.adtclient.login();
+            return await fn();
+          } catch (finalError: any) {
+            throw new McpError(
+              ErrorCode.InternalError,
+              `Session expired and re-login failed: ${finalError.message || 'Unknown error'}`
+            );
+          }
         }
       }
       throw error;

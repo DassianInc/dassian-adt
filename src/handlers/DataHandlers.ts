@@ -9,6 +9,7 @@ export class DataHandlers extends BaseHandler {
     return [
       {
         name: 'abap_query',
+        annotations: { readOnlyHint: true },
         description:
           'Execute a SQL query against the SAP database via ADT. ' +
           'Use OpenSQL syntax (FROM clause, WHERE, ORDER BY). ' +
@@ -24,6 +25,7 @@ export class DataHandlers extends BaseHandler {
       },
       {
         name: 'abap_table',
+        annotations: { readOnlyHint: true },
         description:
           'Read contents of an ABAP table or CDS view. ' +
           'Supports an optional WHERE clause including LIKE, BETWEEN, and comparisons. ' +

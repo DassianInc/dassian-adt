@@ -8,6 +8,7 @@ export class GitHandlers extends BaseHandler {
     return [
       {
         name: 'git_repos',
+        annotations: { readOnlyHint: true },
         description: 'List all gCTS repositories registered on this SAP system.',
         inputSchema: { type: 'object', properties: {} }
       },

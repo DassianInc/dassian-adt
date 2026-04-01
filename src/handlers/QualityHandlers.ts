@@ -10,6 +10,7 @@ export class QualityHandlers extends BaseHandler {
     return [
       {
         name: 'abap_syntax_check',
+        annotations: { readOnlyHint: true },
         description:
           'Run a syntax check on an ABAP object. Returns errors and warnings. ' +
           'Use this after writing source to verify correctness before activating. ' +
@@ -26,6 +27,7 @@ export class QualityHandlers extends BaseHandler {
       },
       {
         name: 'abap_atc_run',
+        annotations: { readOnlyHint: true },
         description:
           'Run ABAP Test Cockpit (ATC) checks on an object. ' +
           'Returns findings grouped by severity (error, warning, info). ' +
@@ -44,6 +46,7 @@ export class QualityHandlers extends BaseHandler {
       },
       {
         name: 'abap_atc_variants',
+        annotations: { readOnlyHint: true },
         description:
           'Return ATC system customizing (configured properties and exemption kinds). ' +
           'Use this to diagnose ATC variant issues. Note: SAP does not expose a standard endpoint to list all variant names — ' +
@@ -58,6 +61,7 @@ export class QualityHandlers extends BaseHandler {
       },
       {
         name: 'abap_where_used',
+        annotations: { readOnlyHint: true },
         description:
           'Find all references to an ABAP object (where-used list). ' +
           'Returns every object that references the target, with object name, type, package, and description. ' +
@@ -77,6 +81,7 @@ export class QualityHandlers extends BaseHandler {
       },
       {
         name: 'abap_find_definition',
+        annotations: { readOnlyHint: true },
         description:
           'Jump to the definition of an ABAP symbol at a specific source position. ' +
           'Given a source object and a line/column, returns the object and line where that symbol is defined. ' +
@@ -253,11 +258,13 @@ export class QualityHandlers extends BaseHandler {
       }
 
       // Step 2: Trigger a fresh ATC run using the resolved ID.
+      await this.notify(`Running ATC on ${args.name} (variant: ${variant})…`);
       const runResult = await this.withSession(() =>
         this.adtclient.createAtcRun(worklistId, objectUrl, 100)
       );
 
       // Step 3: Fetch findings using run ID + timestamp.
+      await this.notify(`ATC run complete — fetching findings…`);
       const worklist = await this.withSession(() =>
         this.adtclient.atcWorklists(runResult.id, runResult.timestamp, '', false)
       );

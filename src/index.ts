@@ -7,6 +7,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
   McpError,
   ErrorCode
 } from '@modelcontextprotocol/sdk/types.js';
@@ -28,6 +30,80 @@ import { renderLoginPage, renderLoginSuccess } from './auth/loginPage.js';
 
 config({ path: path.resolve(__dirname, '../.env') });
 
+// ─── MCP Prompts ─────────────────────────────────────────────────────────────
+// Pre-built workflows callable as slash commands from Claude Code.
+
+interface PromptDef {
+  name: string;
+  description: string;
+  messages: (args: Record<string, string>) => Array<{ role: 'user' | 'assistant'; content: { type: 'text'; text: string } }>;
+}
+
+const PROMPTS: PromptDef[] = [
+  {
+    name: 'fix-atc',
+    description: 'Run ATC on an ABAP object, read all P1 findings, fix each one, and activate.',
+    messages: (args) => [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Run ATC on the ABAP object "${args.name || '<name>'}" (type: ${args.type || 'CLAS'}).
+For every Priority 1 finding:
+1. Read the relevant source (use compact=true first for classes to understand the structure)
+2. Fix the finding — prefer a real code fix over an exemption
+3. Syntax-check before writing
+4. After all fixes, activate the object
+Report a summary of what was fixed.`
+      }
+    }]
+  },
+  {
+    name: 'transport-review',
+    description: 'List transport contents, syntax-check all objects, and report issues.',
+    messages: (args) => [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Review transport "${args.transport || '<transport>'}":
+1. List all objects in the transport with transport_contents
+2. For each ABAP source object (CLAS, PROG, FUGR, INTF), run abap_syntax_check
+3. Report any syntax errors with line numbers
+4. If clean, confirm the transport is ready for release.`
+      }
+    }]
+  },
+  {
+    name: 'class-overview',
+    description: 'Get a compact interface summary of a class plus its where-used count.',
+    messages: (args) => [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Give me an overview of ABAP class "${args.name || '<class name>'}":
+1. Get the compact source (abap_get_source with compact=true) to see the full interface
+2. Get the where-used count (abap_where_used) to understand how widely it's used
+3. Summarize: what the class does, its public API, and how many things depend on it.`
+      }
+    }]
+  },
+  {
+    name: 'release-transport',
+    description: 'Check, syntax-validate, and release a transport.',
+    messages: (args) => [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Prepare and release transport "${args.transport || '<transport>'}":
+1. Show the transport contents
+2. Syntax-check every ABAP object in the transport
+3. If there are syntax errors, stop and report them — do NOT release
+4. If all clean, release the transport (task first, then request)
+5. Confirm the release status.`
+      }
+    }]
+  },
+];
+
 export class AbapAdtServer extends Server {
   private adtClient: ADTClient;
   private sourceHandlers:    SourceHandlers;
@@ -42,7 +118,7 @@ export class AbapAdtServer extends Server {
   constructor(sapUrl?: string, sapUser?: string, sapPassword?: string, sapClient?: string, sapLanguage?: string) {
     super(
       { name: 'dassian-adt', version: '2.0.0' },
-      { capabilities: { tools: {} } }
+      { capabilities: { tools: {}, logging: {}, prompts: {} } }
     );
 
     const url = sapUrl || process.env.SAP_URL;
@@ -67,8 +143,29 @@ export class AbapAdtServer extends Server {
     this.systemHandlers    = new SystemHandlers(this.adtClient);
 
     const elicitFn = (params: any) => this.elicitInput(params);
+
+    const notifyFn = async (level: 'info' | 'warning' | 'error', message: string) => {
+      await this.sendLoggingMessage({ level, data: message });
+    };
+
+    const samplingFn = async (systemPrompt: string, userMessage: string, maxTokens = 200): Promise<string> => {
+      const caps = this.getClientCapabilities();
+      if (!(caps as any)?.sampling) {
+        throw new Error('Client does not support sampling');
+      }
+      const result = await this.createMessage({
+        messages: [{ role: 'user', content: { type: 'text', text: userMessage } }],
+        systemPrompt,
+        maxTokens,
+        includeContext: 'none',
+      });
+      return result.content.type === 'text' ? result.content.text : '';
+    };
+
     for (const handler of this.allHandlers()) {
       handler.setElicit(elicitFn);
+      handler.setNotify(notifyFn);
+      handler.setSampling(samplingFn);
     }
 
     this.setupHandlers();
@@ -86,6 +183,17 @@ export class AbapAdtServer extends Server {
     this.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: this.allHandlers().flatMap(h => h.getTools())
     }));
+
+    this.setRequestHandler(ListPromptsRequestSchema, async () => ({
+      prompts: PROMPTS.map(p => ({ name: p.name, description: p.description }))
+    }));
+
+    this.setRequestHandler(GetPromptRequestSchema, async (request) => {
+      const p = PROMPTS.find(p => p.name === request.params.name);
+      if (!p) throw new McpError(ErrorCode.InvalidRequest, `Unknown prompt: ${request.params.name}`);
+      const args = request.params.arguments || {};
+      return { messages: p.messages(args) };
+    });
 
     this.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;

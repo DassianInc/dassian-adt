@@ -9,6 +9,7 @@ export class SystemHandlers extends BaseHandler {
     return [
       {
         name: 'login',
+        annotations: { idempotentHint: true },
         description:
           'Establish a stateful session with the SAP system. ' +
           'Most tools call this automatically via withSession() — you only need to call login() explicitly ' +
@@ -17,11 +18,13 @@ export class SystemHandlers extends BaseHandler {
       },
       {
         name: 'healthcheck',
+        annotations: { readOnlyHint: true },
         description: 'Verify connectivity to the SAP system. Returns system ID and login status.',
         inputSchema: { type: 'object', properties: {} }
       },
       {
         name: 'abap_get_dump',
+        annotations: { readOnlyHint: true },
         description:
           'Retrieve recent ABAP short dumps (ST22). ' +
           'Returns dump list with error text, program, and timestamp. ' +
