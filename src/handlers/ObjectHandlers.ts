@@ -184,14 +184,14 @@ export class ObjectHandlers extends BaseHandler {
         const escDesc = (args.description || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         const body =
           `<?xml version="1.0" encoding="UTF-8"?>\n` +
-          `<blues:behaviorDefinition\n` +
-          `  xmlns:blues="http://www.sap.com/adt/bo/blues"\n` +
+          `<blue:blueSource\n` +
+          `  xmlns:blue="http://www.sap.com/wbobj/blue"\n` +
           `  xmlns:adtcore="http://www.sap.com/adt/core"\n` +
           `  adtcore:description="${escDesc}"\n` +
           `  adtcore:name="${args.name.toUpperCase()}"\n` +
           `  adtcore:responsible="${username}">\n` +
           `  <adtcore:packageRef adtcore:name="${args.package}"/>\n` +
-          `</blues:behaviorDefinition>`;
+          `</blue:blueSource>`;
         const qs: any = {};
         if (args.transport) qs.corrNr = args.transport;
         await this.withSession(() =>
