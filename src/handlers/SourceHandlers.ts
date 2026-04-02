@@ -355,11 +355,25 @@ export class SourceHandlers extends BaseHandler {
     }
     let lockHandle: string | null = null;
 
+    const tryLock = async (): Promise<string> => {
+      try {
+        const r = await this.withSession(() => this.adtclient.lock(objectUrl!));
+        return r.LOCK_HANDLE;
+      } catch (e: any) {
+        const m = String(e?.message || '');
+        // Newly created objects can be left locked by the creation session's ADT cookie.
+        // Wait briefly and retry once — the lock usually clears within seconds.
+        if (/locked by another/i.test(m)) {
+          await new Promise(res => setTimeout(res, 3000));
+          const r2 = await this.withSession(() => this.adtclient.lock(objectUrl!));
+          return r2.LOCK_HANDLE;
+        }
+        throw e;
+      }
+    };
+
     try {
-      const lockResult = await this.withSession(() =>
-        this.adtclient.lock(objectUrl)
-      );
-      lockHandle = lockResult.LOCK_HANDLE;
+      lockHandle = await tryLock();
 
       await this.withSession(() =>
         this.adtclient.setObjectSource(sourceUrl, args.source, lockHandle!, args.transport)
