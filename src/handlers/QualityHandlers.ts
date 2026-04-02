@@ -83,10 +83,10 @@ export class QualityHandlers extends BaseHandler {
         name: 'abap_find_definition',
         annotations: { readOnlyHint: true },
         description:
-          'Jump to the definition of an ABAP symbol at a specific source position. ' +
-          'Given a source object and a line/column, returns the object and line where that symbol is defined. ' +
-          'Equivalent to F3 / Ctrl+Click in Eclipse ADT. ' +
-          'Use this to navigate from a method call to its implementation, or from a type usage to its definition.',
+          'Jump to the definition of an ABAP symbol at a specific cursor position in source code. ' +
+          'Requires a source object (name+type) AND the exact line/column where the symbol appears — ' +
+          'NOT an object name lookup. First call abap_get_source to read the code and locate the symbol, ' +
+          'then pass those coordinates here. Equivalent to F3 / Ctrl+Click in Eclipse ADT.',
         inputSchema: {
           type: 'object',
           properties: {

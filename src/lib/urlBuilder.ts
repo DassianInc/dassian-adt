@@ -34,6 +34,7 @@ const TYPE_PATHS: Record<string, string> = {
   'TABL':     '/sap/bc/adt/ddic/tables',
   'TABL/DT':  '/sap/bc/adt/ddic/tables',
   'TABL/DS':  '/sap/bc/adt/ddic/structures',
+  'STRU':     '/sap/bc/adt/ddic/structures',   // SE11 structures (alias for TABL/DS)
   'DTEL':     '/sap/bc/adt/ddic/dataelements',
   'DTEL/DE':  '/sap/bc/adt/ddic/dataelements',
   'DOMA':     '/sap/bc/adt/ddic/domains',

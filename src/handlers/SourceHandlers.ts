@@ -151,6 +151,15 @@ export class SourceHandlers extends BaseHandler {
 
       return this.success({ source, name: args.name, type: args.type });
     } catch (error: any) {
+      const msg = String(error?.message || error || '');
+      // DDIC objects (TABL, STRU) that have never been modified only exist in active form.
+      // ADT's source endpoint returns "inactive version does not exist" in that case.
+      if (/inactive version/i.test(msg)) {
+        const typeHint = ['TABL', 'STRU', 'TABL/DT', 'TABL/DS'].includes(args.type?.toUpperCase())
+          ? ' For DDIC objects with no pending changes, use abap_table to read field metadata instead.'
+          : ' The object exists but has no inactive version — it may have never been edited.';
+        this.fail(formatError(`abap_get_source(${args.name})`, error) + typeHint);
+      }
       this.fail(formatError(`abap_get_source(${args.name})`, error));
     }
   }
