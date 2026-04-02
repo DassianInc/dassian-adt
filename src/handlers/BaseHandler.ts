@@ -279,6 +279,10 @@ export abstract class BaseHandler {
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
 
+    // Normalize common LLM parameter-name mistakes before required-field validation
+    if (args && !args.name && args.object_name) args.name = args.object_name;
+    if (args && !args.type && args.object_type) args.type = args.object_type;
+
     const required = (tool.inputSchema as any).required || [];
     const missing = required.filter((f: string) => {
       const val = args?.[f];
