@@ -361,12 +361,22 @@ export class SourceHandlers extends BaseHandler {
         return r.LOCK_HANDLE;
       } catch (e: any) {
         const m = String(e?.message || '');
-        // Newly created objects can be left locked by the creation session's ADT cookie.
-        // Wait briefly and retry once — the lock usually clears within seconds.
+        // ADT CDS locks don't always appear in SM12 — they use a separate mechanism.
+        // Stale locks from previous sessions/creates clear on their own within seconds.
+        // Retry up to 2 times with increasing delays before giving up.
         if (/locked by another/i.test(m)) {
-          await new Promise(res => setTimeout(res, 3000));
-          const r2 = await this.withSession(() => this.adtclient.lock(objectUrl!));
-          return r2.LOCK_HANDLE;
+          for (const delay of [3000, 8000]) {
+            await new Promise(res => setTimeout(res, delay));
+            try {
+              const r2 = await this.withSession(() => this.adtclient.lock(objectUrl!));
+              return r2.LOCK_HANDLE;
+            } catch (_) {}
+          }
+          throw new Error(
+            `Cannot lock ${args.name} — a stale ADT session lock is blocking it. ` +
+            `Note: ADT CDS source locks do NOT appear in SM12. ` +
+            `Wait 30-60 seconds and retry, or have the conflicting Eclipse/ADT session close the editor.`
+          );
         }
         throw e;
       }
