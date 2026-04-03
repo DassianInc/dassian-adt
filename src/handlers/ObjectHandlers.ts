@@ -175,6 +175,77 @@ export class ObjectHandlers extends BaseHandler {
     const createType = ObjectHandlers.CREATE_TYPE_MAP[typeKey] || args.type;
     const packageUrl = buildPackageUrl(args.package);
 
+    // DEVC (package) creation requires software component and transport layer — the library's
+    // createObject sends a minimal XML that SAP rejects with "incomplete data". We look up
+    // those values from the parent package and POST the full XML directly.
+    if (typeKey === 'DEVC') {
+      try {
+        const h = (this.adtclient as any).h;
+        const username = ((h.username || 'UNKNOWN') as string).toUpperCase();
+
+        // Derive software component and transport layer from parent package
+        const parentEncoded = args.package.replace(/\//g, '%2f').replace(/\$/g, '%24').toLowerCase();
+        let softwareComponent = '';
+        let transportLayer = '';
+        try {
+          const parentResp = await this.withSession(() =>
+            h.request(`/sap/bc/adt/packages/${parentEncoded}`, { method: 'GET', headers: { Accept: 'application/xml' } })
+          );
+          const parentXml: string = (parentResp as any).body || '';
+          const scMatch = parentXml.match(/pak:softwareComponent[^/]*pak:name="([^"]+)"/);
+          const tlMatch = parentXml.match(/pak:transportLayer[^/]*pak:name="([^"]+)"/);
+          if (scMatch) softwareComponent = scMatch[1];
+          if (tlMatch) transportLayer = tlMatch[1];
+        } catch (_) {
+          // If parent lookup fails, user must provide them — fail with a clear message
+          this.fail(
+            `abap_create(${args.name}): Could not read parent package ${args.package} to derive ` +
+            `software component and transport layer. Check the package name is correct.`
+          );
+        }
+
+        const escDesc = (args.description || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const nameUpper = args.name.toUpperCase();
+        const packageUpper = args.package.toUpperCase();
+        const nameEncoded = nameUpper.replace(/\//g, '%2f').replace(/\$/g, '%24').toLowerCase();
+        const body =
+          `<?xml version="1.0" encoding="utf-8"?>\n` +
+          `<pak:package\n` +
+          `  adtcore:responsible="${username}"\n` +
+          `  adtcore:masterLanguage="EN"\n` +
+          `  adtcore:name="${nameUpper}"\n` +
+          `  adtcore:description="${escDesc}"\n` +
+          `  xmlns:pak="http://www.sap.com/adt/packages"\n` +
+          `  xmlns:adtcore="http://www.sap.com/adt/core">\n` +
+          `  <pak:attributes pak:packageType="development"/>\n` +
+          `  <pak:superPackage adtcore:name="${packageUpper}"/>\n` +
+          `  <pak:applicationComponent pak:name=""/>\n` +
+          `  <pak:transport>\n` +
+          `    <pak:softwareComponent pak:name="${softwareComponent}"/>\n` +
+          `    <pak:transportLayer pak:name="${transportLayer}"/>\n` +
+          `  </pak:transport>\n` +
+          `</pak:package>`;
+        const qs: any = {};
+        if (args.transport) qs.corrNr = args.transport;
+        await this.withSession(() =>
+          h.request(`/sap/bc/adt/packages/${nameEncoded}`, {
+            method: 'POST', body, qs,
+            headers: { 'Content-Type': 'application/vnd.sap.adt.package+xml' }
+          })
+        );
+        return this.success({
+          message: `Created package ${args.name} under ${args.package} (${softwareComponent} / ${transportLayer}).`,
+          name: args.name,
+          type: 'DEVC',
+          package: args.package,
+          softwareComponent,
+          transportLayer
+        });
+      } catch (error: any) {
+        this.fail(formatError(`abap_create(${args.name})`, error));
+      }
+    }
+
     // BDEF requires a custom Content-Type (application/vnd.sap.adt.blues.v1+xml) that the
     // library's createObject does not support. Bypass it and call the ADT endpoint directly.
     if (typeKey === 'BDEF') {
