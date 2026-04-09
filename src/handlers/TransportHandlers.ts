@@ -225,36 +225,82 @@ export class TransportHandlers extends BaseHandler {
     try {
       try {
         await this.notify(`Releasing ${args.transport}…`);
-        const result = await this.withSession(() =>
-          this.adtclient.transportRelease(args.transport, args.ignoreAtc || false)
-        );
+        const result = await this.releaseOne(args.transport, args.ignoreAtc || false);
         return this.success({ transport: args.transport, released: true, result });
       } catch (firstError: any) {
         const msg = (firstError?.message || '').toLowerCase();
         if (msg.includes('task') && (msg.includes('not yet released') || msg.includes('referencing'))) {
-          // Get transport details to find child tasks, release them first
-          const info = await this.withSession(() =>
-            this.adtclient.transportInfo(args.transport)
+          // Parent request can't release yet — find and release its tasks first.
+          // userTransports gives us the full request→task structure.
+          const user = (this.adtclient as any).username || (this.adtclient as any).h?.username;
+          const transports = await this.withSession(() =>
+            this.adtclient.userTransports(user)
           ) as any;
 
-          const tasks: string[] = (info?.tasks || []).map((t: any) => t.number || t).filter(Boolean);
+          // Walk workbench targets to find the request and extract its tasks
+          const tasks: string[] = [];
+          const allRequests = (transports?.workbench ?? []).flatMap((t: any) =>
+            [...(t.modifiable ?? []), ...(t.released ?? [])]
+          );
+          for (const req of allRequests) {
+            const reqNum: string = req['tm:number'] || req.number || '';
+            if (reqNum.toUpperCase() === args.transport.toUpperCase()) {
+              for (const task of (req.tasks ?? [])) {
+                const taskNum: string = task['tm:number'] || task.number || '';
+                if (taskNum) tasks.push(taskNum);
+              }
+              break;
+            }
+          }
+
           for (const task of tasks) {
             await this.notify(`Releasing task ${task}…`);
-            await this.withSession(() =>
-              this.adtclient.transportRelease(task, args.ignoreAtc || false)
-            );
+            await this.releaseOne(task, args.ignoreAtc || false);
           }
 
           await this.notify(`Releasing request ${args.transport}…`);
-          const result = await this.withSession(() =>
-            this.adtclient.transportRelease(args.transport, args.ignoreAtc || false)
-          );
+          const result = await this.releaseOne(args.transport, args.ignoreAtc || false);
           return this.success({ transport: args.transport, released: true, tasksReleased: tasks, result });
         }
         throw firstError;
       }
     } catch (error: any) {
       this.fail(formatError(`transport_release(${args.transport})`, error));
+    }
+  }
+
+  /**
+   * Release a single transport or task.
+   * Older SAP systems (S/4 2022) require an XML request body for the POST;
+   * the library sends none. When we get the "expected element" error, retry
+   * via the underlying HTTP client with a minimal <tm:root> body.
+   */
+  private async releaseOne(transportNumber: string, ignoreAtc: boolean): Promise<any> {
+    try {
+      // ADTClient.transportRelease(number, ignoreLocks, IgnoreATC)
+      // Pass false for ignoreLocks; use ignoreAtc for the 3rd param.
+      return await this.withSession(() =>
+        this.adtclient.transportRelease(transportNumber, false, ignoreAtc)
+      );
+    } catch (err: any) {
+      const msg = (err?.message || '').toLowerCase();
+      // Older SAP systems return "System expected the element '{...tm}root'" when the POST body
+      // is empty — they require a minimal <tm:root> XML body.
+      if (msg.includes('expected the element') || msg.includes('tm}root') || msg.includes('tm:root')) {
+        const h = (this.adtclient as any).h;
+        const action = ignoreAtc ? 'relObjigchkatc' : 'newreleasejobs';
+        return await this.withSession(() =>
+          h.request(`/sap/bc/adt/cts/transportrequests/${transportNumber}/${action}`, {
+            method: 'POST',
+            headers: {
+              Accept: 'application/*',
+              'Content-Type': 'application/xml'
+            },
+            body: `<tm:root xmlns:tm="http://www.sap.com/cts/adt/tm"/>`
+          })
+        );
+      }
+      throw err;
     }
   }
 
