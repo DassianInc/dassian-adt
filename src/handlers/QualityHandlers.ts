@@ -1,7 +1,7 @@
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
-import { buildObjectUrl, buildSourceUrl, NESTED_TYPES } from '../lib/urlBuilder.js';
+import { buildObjectUrl, buildSourceUrl, buildMethodUrl, NESTED_TYPES } from '../lib/urlBuilder.js';
 import { formatError } from '../lib/errors.js';
 import type { UsageReference } from 'abap-adt-api';
 
@@ -66,12 +66,15 @@ export class QualityHandlers extends BaseHandler {
           'Find all references to an ABAP object (where-used list). ' +
           'Returns every object that references the target, with object name, type, package, and description. ' +
           'Equivalent to Ctrl+Shift+G in Eclipse ADT or SE12 where-used in SAP GUI. ' +
-          'Use this before deleting or modifying objects to understand the impact.',
+          'Use this before deleting or modifying objects to understand the impact. ' +
+          'For class methods use type CLAS/OM with name="CLASS_NAME::METHOD_NAME" (e.g. "/DSN/MY_CLASS::GET_CONT") ' +
+          'or pass name=class and method=method_name separately.',
         inputSchema: {
           type: 'object',
           properties: {
-            name: { type: 'string', description: 'Object name, e.g. /DSN/GPD_DISRP or /DSN/CL_S4CM_CMB_CONTRACT' },
-            type: { type: 'string', description: 'Object type (e.g. CLAS, VIEW, TABL, DTEL, INTF, PROG, FUGR, DDLS)' },
+            name: { type: 'string', description: 'Object name, e.g. /DSN/GPD_DISRP or /DSN/CL_S4CM_CMB_CONTRACT. For methods: /DSN/MY_CLASS::GET_CONT or just the class name when method param is used.' },
+            type: { type: 'string', description: 'Object type (e.g. CLAS, VIEW, TABL, DTEL, INTF, PROG, FUGR, DDLS). Use CLAS/OM for class methods.' },
+            method: { type: 'string', description: 'Method name when type=CLAS/OM (alternative to CLASS::METHOD syntax in name)' },
             line: { type: 'number', description: 'Optional: line number to find references to a specific symbol at that position' },
             column: { type: 'number', description: 'Optional: column number (used with line) for symbol-level where-used' },
             snippets: { type: 'boolean', description: 'If true, also fetch code snippets showing exactly how the object is used at each location (default: false)' }
@@ -142,10 +145,26 @@ export class QualityHandlers extends BaseHandler {
 
   private async handleWhereUsed(args: any): Promise<any> {
     if (!args.name || !args.type) {
-      this.fail('abap_where_used requires name (object name) and type (e.g. CLAS, VIEW, TABL).');
+      this.fail('abap_where_used requires name (object name) and type (e.g. CLAS, VIEW, TABL). For class methods use type CLAS/OM with name="CLASS::METHOD" or name=class + method=method_name.');
     }
     try {
-      const objectUrl = buildObjectUrl(args.name, args.type);
+      let objectUrl: string;
+      if (args.type?.toUpperCase() === 'CLAS/OM') {
+        // Method where-used: name="CLASS::METHOD" or name=class + method=method_name
+        let className: string;
+        let methodName: string;
+        if (args.method) {
+          className = args.name;
+          methodName = args.method;
+        } else if (args.name.includes('::')) {
+          [className, methodName] = args.name.split('::');
+        } else {
+          this.fail('For CLAS/OM where-used, provide name="CLASS::METHOD_NAME" or name=class + method=method_name.');
+        }
+        objectUrl = buildMethodUrl(className!, methodName!);
+      } else {
+        objectUrl = buildObjectUrl(args.name, args.type);
+      }
 
       // Basis 759 (S/4HANA 2025) returns "usagereferences:" namespace prefix (all lowercase)
       // but the library's XML parser looks for "usageReferences:" (camelCase), giving 0 results.

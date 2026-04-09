@@ -2,7 +2,7 @@ import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
 import { buildObjectUrl, buildSourceUrl, getSupportedTypes, NESTED_TYPES } from '../lib/urlBuilder.js';
-import { formatError } from '../lib/errors.js';
+import { formatError, parseAdtError } from '../lib/errors.js';
 
 const SUPPORTED = getSupportedTypes().join(', ');
 
@@ -403,14 +403,42 @@ export class SourceHandlers extends BaseHandler {
     // This is critical: if a session timeout fires mid-sequence and withSession re-logins,
     // the entire block retries — so the new lock handle is acquired in the new session,
     // preventing "lock handle from dead session used in new session" rejections.
+    //
+    // The most common failure pattern is:
+    //   lock() OK → setObjectSource() → HTTP 400 (stale CSRF / SM04 killed our session)
+    //   → unLock() ALSO fails (same dead session) → lock persists on SAP's enqueue server
+    //   → withSession re-logins → doWrite retries → lock() → "locked by another" (us!)
+    //
+    // Fix: when unLock fails after a dead-session 400, sleep briefly before rethrowing.
+    // withSession will re-login during that sleep, and by the time doWrite runs again SAP's
+    // session cleanup has released the orphaned enqueue entry.
+    let unlockFailedAfterDeadSession = false;
+
     const doWrite = async (): Promise<void> => {
+      unlockFailedAfterDeadSession = false;
       const r = await this.adtclient.lock(objectUrl!);
       lockHandle = r.LOCK_HANDLE;
       try {
         await this.adtclient.setObjectSource(sourceUrl!, args.source, lockHandle!, args.transport);
       } catch (writeErr: any) {
-        try { await this.adtclient.unLock(objectUrl!, lockHandle!); } catch (_) {}
+        let unlockOk = false;
+        try {
+          await this.adtclient.unLock(objectUrl!, lockHandle!);
+          unlockOk = true;
+        } catch (_) {}
         lockHandle = null;
+
+        // If unLock failed AND the write error looks like a dead session (ambiguous 400),
+        // SAP's enqueue server still holds our lock handle. Sleep so session cleanup can run
+        // before withSession's immediate re-login retry calls lock() again.
+        if (!unlockOk) {
+          const writeInfo = parseAdtError(writeErr);
+          if (writeInfo.isAmbiguous400 || writeInfo.isSessionTimeout) {
+            unlockFailedAfterDeadSession = true;
+            await new Promise(r => setTimeout(r, 3000));
+          }
+        }
+
         throw writeErr;
       }
       await this.adtclient.unLock(objectUrl!, lockHandle!);
@@ -421,8 +449,12 @@ export class SourceHandlers extends BaseHandler {
       // Retry up to twice if locked by another session (stale locks clear within seconds).
       // Use abap_unlock to force-release if retries all fail.
       let lastError: any;
-      for (const delay of [0, 3000, 8000]) {
-        if (delay > 0) await new Promise(r => setTimeout(r, delay));
+      for (let i = 0; i < 3; i++) {
+        const delay = [0, 3000, 8000][i];
+        if (delay > 0) {
+          await this.notify(`Object locked — waiting ${delay / 1000}s before retry (attempt ${i + 1}/3)…`, 'warning');
+          await new Promise(r => setTimeout(r, delay));
+        }
         try {
           await this.withSession(doWrite);
           lastError = null;
@@ -482,8 +514,15 @@ export class SourceHandlers extends BaseHandler {
       try {
         await this.adtclient.setObjectSource(sourceUrl, source, lockHandle!, transport);
       } catch (err: any) {
-        try { await this.adtclient.unLock(objectUrl, lockHandle!); } catch (_) {}
+        let unlockOk = false;
+        try { await this.adtclient.unLock(objectUrl, lockHandle!); unlockOk = true; } catch (_) {}
         lockHandle = null;
+        if (!unlockOk) {
+          const writeInfo = parseAdtError(err);
+          if (writeInfo.isAmbiguous400 || writeInfo.isSessionTimeout) {
+            await new Promise(r => setTimeout(r, 3000));
+          }
+        }
         throw err;
       }
       await this.adtclient.unLock(objectUrl, lockHandle!);
@@ -492,8 +531,12 @@ export class SourceHandlers extends BaseHandler {
 
     try {
       let lastError: any;
-      for (const delay of [0, 3000, 8000]) {
-        if (delay > 0) await new Promise(r => setTimeout(r, delay));
+      for (let i = 0; i < 3; i++) {
+        const delay = [0, 3000, 8000][i];
+        if (delay > 0) {
+          await this.notify(`Object locked — waiting ${delay / 1000}s before retry (attempt ${i + 1}/3)…`, 'warning');
+          await new Promise(r => setTimeout(r, delay));
+        }
         try {
           await this.withSession(doWrite);
           lastError = null;

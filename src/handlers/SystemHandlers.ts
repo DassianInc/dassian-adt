@@ -50,9 +50,13 @@ export class SystemHandlers extends BaseHandler {
           '(3) Any ADT endpoint not exposed as a dedicated tool. ' +
           'For SITO source writes: method=PUT, path=/sap/bc/adt/ddls/SITO_NAME/source/main?lockHandle=LOCK, ' +
           'contentType=application/json, body=<JSON source>. ' +
-          'WARNING: raw_http CANNOT be used for stateful multi-step sequences (lock → write → unlock). ' +
-          'Each raw_http call may get a different ICM HTTP session, making lock handles invalid for subsequent calls. ' +
-          'Use abap_set_source, abap_set_class_include, or abap_edit_method for any operation requiring a lock.',
+          'HARD RULE — NEVER use raw_http to POST to lock endpoints (?method=adtLock) or attempt to ' +
+          'acquire, probe, or release locks via raw_http. Even a failed lock POST leaves a stale ICM ' +
+          'session lock with no matching handle on our side, causing every subsequent abap_set_source to ' +
+          'fail with "locked by another" until the user manually kills sessions in SM04. ' +
+          'raw_http also CANNOT be used for any stateful multi-step sequence (lock → write → unlock): ' +
+          'each call may get a different ICM session, making lock handles invalid for subsequent calls. ' +
+          'Use abap_set_source, abap_set_class_include, or abap_edit_method for any write operation.',
         inputSchema: {
           type: 'object',
           properties: {

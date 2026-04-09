@@ -10,6 +10,8 @@ export interface AdtErrorInfo {
   isUpgradeMode: boolean;
   isLocked: boolean;
   isNotFound: boolean;
+  /** True when a 400 has no meaningful body — typically a stale CSRF token or expired session. */
+  isAmbiguous400: boolean;
   httpStatus?: number;
 }
 
@@ -89,6 +91,7 @@ export function parseAdtError(error: any): AdtErrorInfo {
       status === 404 ||
       msg.includes('does not exist') ||
       msg.includes('not found'),
+    isAmbiguous400,
     httpStatus: status,
   };
 }
@@ -106,10 +109,22 @@ export function formatError(operation: string, error: any): string {
     );
   }
 
+  // A 400 with no meaningful body is almost always a stale CSRF token caused by an expired or
+  // externally-killed session (SM04). withSession already attempted a re-login — if the error
+  // still reaches here the session state is genuinely broken. Call login() explicitly to reset.
+  if (info.isAmbiguous400) {
+    return (
+      `${operation} failed: HTTP 400 with no error detail — this is a stale CSRF token or expired ` +
+      `session, NOT a bad request. Call login() to establish a fresh session, then retry the operation.`
+    );
+  }
+
   if (info.isLocked) {
     return (
       `${operation} failed: object is locked by another user or session. ` +
-      `Check SM12 to see who holds the lock, or wait for it to release.`
+      `Check SM12 to see who holds the lock. ` +
+      `If SM12 is empty, the lock is a stale ADT enqueue entry from an expired session — ` +
+      `call login() to refresh the session (withSession will retry automatically), or use abap_unlock.`
     );
   }
 

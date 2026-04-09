@@ -139,6 +139,15 @@ export function buildFunctionIncludeUrl(fgroupName: string, includeName: string)
 }
 
 /**
+ * Build the ADT URL for a class method.
+ * className: the class (e.g. /DSN/MY_CLASS)
+ * methodName: the method (e.g. GET_CONT)
+ */
+export function buildMethodUrl(className: string, methodName: string): string {
+  return `/sap/bc/adt/oo/classes/${encodeAbapName(className)}/methods/${methodName.toLowerCase()}`;
+}
+
+/**
  * Types that require a parent name to construct their URL.
  * For these, SourceHandlers will use searchObject to auto-discover the full URL.
  */
