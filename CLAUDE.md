@@ -80,6 +80,8 @@ await this.withSession(doWrite);
 - `isAmbiguous400` — HTTP 400 with no meaningful body; treated as session expiry (stale CSRF token). `withSession` detects this and re-logins automatically.
 - `formatError(operation, error)` — converts classified errors into actionable human-readable messages with self-correction hints (what to call next, why it failed)
 
+**`AdtErrorException` field layout:** The library stores the HTTP status in `.err` (not `.response.status` — `.response` is often `undefined`). `parseAdtError` reads `error?.response?.status ?? error?.err` so both shapes are covered. Do not rely on `error?.response?.status` alone.
+
 When adding a new error condition, update `parseAdtError` first (adds detection), then `formatError` (adds the message).
 
 ### URL Construction
@@ -89,6 +91,12 @@ When adding a new error condition, update `parseAdtError` first (adds detection)
 Namespace encoding: `/` → `%2f`, `$` → `%24`, always lowercase. Handled by `encodeAbapName()`.
 
 Nested types (FUGR/I, FUGR/FF) require runtime URL discovery via `searchObject` — see `resolveNestedUrl` in `BaseHandler`.
+
+### Transport Release: Older System Compatibility
+
+`TransportHandlers.releaseOne(number, ignoreAtc)` wraps `adtclient.transportRelease`. Older SAP systems (S/4 2022, X22) require an XML `<tm:root>` request body in the release POST — the library sends no body. When the "expected the element" error appears, `releaseOne` retries via `h.request` with the body.
+
+`ADTClient.transportRelease` signature: `(transportNumber, ignoreLocks, IgnoreATC)` — `ignoreAtc` goes in the **third** slot, not second.
 
 ### Transport Assign: Metadata vs Source Types
 
@@ -110,4 +118,4 @@ Adding a type that breaks on lock/write (e.g., generates inactive includes) to `
 
 Unit tests (`src/__tests__/unit/`) test `urlBuilder.ts` and `errors.ts` exhaustively and `BaseHandler` validation — no mocking of `adtclient`. Integration and E2E tests require live SAP connection via environment variables (`SAP_URL`, `SAP_USER`, `SAP_PASSWORD`, `SAP_CLIENT`).
 
-The 3 known failing unit tests are stale expectations for SRVD/SRVB URL paths — the code is correct, the test assertions need updating.
+The 2 known failing unit tests are stale expectations for SRVD/SRVB URL paths — the code is correct, the test assertions need updating.
