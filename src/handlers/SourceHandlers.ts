@@ -344,7 +344,9 @@ export class SourceHandlers extends BaseHandler {
         const r = await this.adtclient.lock(objectUrl);
         lockHandle = r.LOCK_HANDLE;
         try {
-          await this.adtclient.setObjectSource(sourceUrl, newSource, lockHandle!, transport);
+          // Transport guard: reject writes to non-$TMP objects without a transport
+          args.transport = this.requireTransport(r, args.transport, name);
+          await this.adtclient.setObjectSource(sourceUrl, newSource, lockHandle!, args.transport);
         } catch (err) {
           try { await this.adtclient.unLock(objectUrl, lockHandle!); } catch (_) {}
           lockHandle = null;
@@ -419,6 +421,8 @@ export class SourceHandlers extends BaseHandler {
       const r = await this.adtclient.lock(objectUrl!);
       lockHandle = r.LOCK_HANDLE;
       try {
+        // Transport guard: reject writes to non-$TMP objects without a transport
+        args.transport = this.requireTransport(r, args.transport, args.name);
         await this.adtclient.setObjectSource(sourceUrl!, args.source, lockHandle!, args.transport);
       } catch (writeErr: any) {
         let unlockOk = false;
@@ -445,6 +449,28 @@ export class SourceHandlers extends BaseHandler {
       lockHandle = null;
     };
 
+    // Lockless write for DDIC types: PUT with corrNr only, no lockHandle.
+    // DDLS, DDLX, TABL, etc. use DDIC-internal enqueue locks and return 405 on ?_action=LOCK.
+    const doLocklessWrite = async (): Promise<void> => {
+      if (!args.transport) {
+        throw new Error(
+          `Transport required: ${args.name} is a DDIC object that does not support ADT HTTP locks. ` +
+          `A transport request number is required to write this object.`
+        );
+      }
+      // Resolve the TASK number — transport_create returns the request, but corrNr needs the task.
+      // resolveTaskNumber walks userTransports to find the user's task on the given request.
+      const taskNumber = await this.resolveTaskNumber(args.transport);
+      const h = (this.adtclient as any).h;
+      const ctype = args.source.match(/^<\?xml\s/i) ? 'application/*' : 'text/plain; charset=utf-8';
+      await h.request(sourceUrl!, {
+        body: args.source,
+        method: 'PUT',
+        headers: { 'content-type': ctype },
+        qs: { corrNr: taskNumber }
+      });
+    };
+
     try {
       // Retry up to twice if locked by another session (stale locks clear within seconds).
       // Use abap_unlock to force-release if retries all fail.
@@ -461,9 +487,23 @@ export class SourceHandlers extends BaseHandler {
           break;
         } catch (e: any) {
           lastError = e;
+          const errInfo = parseAdtError(e);
+
+          // Lock not supported (HTTP 405) — DDIC type, fall back to lockless write
+          if (errInfo.isLockNotSupported) {
+            await this.notify(`Lock not supported for ${args.type} — attempting lockless write with transport…`, 'warning');
+            try {
+              await this.withSession(doLocklessWrite);
+              lastError = null;
+            } catch (locklessErr: any) {
+              lastError = locklessErr;
+            }
+            break;
+          }
+
           // Only retry when the error is a lock contention ("already locked", "locked by user", etc.)
           // isLocked covers all SAP lock message variants; break on any other error type.
-          if (!parseAdtError(e).isLocked) break;
+          if (!errInfo.isLocked) break;
         }
       }
       if (lastError) {
@@ -514,7 +554,9 @@ export class SourceHandlers extends BaseHandler {
       const r = await this.adtclient.lock(objectUrl);
       lockHandle = r.LOCK_HANDLE;
       try {
-        await this.adtclient.setObjectSource(sourceUrl, source, lockHandle!, transport);
+        // Transport guard: reject writes to non-$TMP objects without a transport
+        args.transport = this.requireTransport(r, args.transport, name);
+        await this.adtclient.setObjectSource(sourceUrl, source, lockHandle!, args.transport);
       } catch (err: any) {
         let unlockOk = false;
         try { await this.adtclient.unLock(objectUrl, lockHandle!); unlockOk = true; } catch (_) {}

@@ -149,6 +149,63 @@ export abstract class BaseHandler {
   }
 
   /**
+   * Check lock response and enforce transport requirement for non-$TMP objects.
+   * Call immediately after lock() inside write/delete handlers.
+   *
+   * - IS_LOCAL === 'X' → object is in $TMP, no transport needed
+   * - CORRNR set → SAP auto-assigned a transport, use it
+   * - Otherwise → throw so the handler's existing transport-elicit catch block fires
+   *
+   * Returns the effective transport to pass to setObjectSource / corrNr.
+   */
+  protected requireTransport(
+    lockResult: { CORRNR: string; IS_LOCAL: string },
+    transport: string | undefined,
+    objectName: string
+  ): string | undefined {
+    // $TMP objects never need a transport
+    if (lockResult.IS_LOCAL === 'X') return transport;
+    // CORRNR from the lock response is authoritative — it is the TASK number SAP assigned.
+    // Always prefer it over the caller-provided value, which may be the parent REQUEST number.
+    // Using the request number as corrNr captures nothing on the transport.
+    if (lockResult.CORRNR) return lockResult.CORRNR;
+    // Caller provided a transport and SAP didn't auto-assign one (shouldn't happen for non-$TMP)
+    if (transport) return transport;
+    // No transport available — reject the operation
+    throw new Error(
+      `Transport required: ${objectName} is in a transportable package (not $TMP). ` +
+      `Provide a transport request number to record this change.`
+    );
+  }
+
+  /**
+   * Resolve the user's transport TASK number from a REQUEST number.
+   * transport_create returns the request; setObjectSource needs the task (CORRNR).
+   * Walks userTransports to find the task belonging to the current user on that request.
+   * Falls back to the original number if no task found (so the caller can surface the error).
+   */
+  protected async resolveTaskNumber(requestNumber: string): Promise<string> {
+    try {
+      const user = (this.adtclient as any).username || (this.adtclient as any).h?.username;
+      if (!user) return requestNumber;
+      const transports = await this.withSession(() => this.adtclient.userTransports(user)) as any;
+      const allRequests = (transports?.workbench ?? []).flatMap((t: any) =>
+        [...(t.modifiable ?? []), ...(t.released ?? [])]
+      );
+      for (const req of allRequests) {
+        const reqNum: string = req['tm:number'] || req.number || '';
+        if (reqNum.toUpperCase() === requestNumber.toUpperCase()) {
+          // Return the first task belonging to this user (tasks[0] is the user's task)
+          const task = req.tasks?.[0];
+          const taskNum: string = task?.['tm:number'] || task?.number || '';
+          if (taskNum) return taskNum;
+        }
+      }
+    } catch (_) {}
+    return requestNumber; // unchanged if resolution fails
+  }
+
+  /**
    * Execute an ADT operation with automatic re-login on session timeout.
    * Every handler should wrap client calls in this — it makes session errors invisible to users.
    */

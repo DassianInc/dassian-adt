@@ -132,9 +132,17 @@ export class TransportHandlers extends BaseHandler {
         this.adtclient.createTransport(sourceUrl, args.description, devclass)
       );
       const transportNumber = (result as any)?.transportNumber || result;
+      // Resolve the task number — abap_set_source needs the TASK (child), not the REQUEST (parent).
+      // The task number is returned by resolveTaskNumber after userTransports becomes available.
+      const taskNumber = await this.resolveTaskNumber(transportNumber as string);
       return this.success({
         transport: transportNumber,
-        message: `Transport created. Use transport_assign to add objects, then transport_release when ready.`
+        task: taskNumber !== transportNumber ? taskNumber : undefined,
+        message:
+          `Transport ${transportNumber} created` +
+          (taskNumber !== transportNumber ? ` (task: ${taskNumber})` : '') +
+          `. Pass the TASK number (${taskNumber}) — not the request — to abap_set_source, abap_create, etc. ` +
+          `Use transport_assign to add objects, then transport_release when ready.`
       });
     } catch (error: any) {
       const msg = String(error?.message || error || '');
