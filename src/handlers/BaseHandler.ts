@@ -185,24 +185,41 @@ export abstract class BaseHandler {
    * Falls back to the original number if no task found (so the caller can surface the error).
    */
   protected async resolveTaskNumber(requestNumber: string): Promise<string> {
+    // Primary: query E070 directly for child tasks (WHERE STRKORR = request).
+    // This is more reliable than userTransports which may not return task details
+    // for requests owned by other users or in certain transport states.
+    try {
+      const e070 = await this.withSession(() =>
+        this.adtclient.tableContents('E070', 10, false,
+          `SELECT TRKORR FROM E070 WHERE STRKORR = '${requestNumber.toUpperCase()}'`)
+      ) as any;
+      const rows: any[] = e070?.values || e070?.records || e070?.value || [];
+      if (rows.length > 0) {
+        const taskNum: string = rows[0].TRKORR || rows[0].trkorr || '';
+        if (taskNum) return taskNum;
+      }
+    } catch (_) {}
+
+    // Fallback: walk userTransports tree (may be incomplete for some request states).
     try {
       const user = (this.adtclient as any).username || (this.adtclient as any).h?.username;
-      if (!user) return requestNumber;
-      const transports = await this.withSession(() => this.adtclient.userTransports(user)) as any;
-      const allRequests = (transports?.workbench ?? []).flatMap((t: any) =>
-        [...(t.modifiable ?? []), ...(t.released ?? [])]
-      );
-      for (const req of allRequests) {
-        const reqNum: string = req['tm:number'] || req.number || '';
-        if (reqNum.toUpperCase() === requestNumber.toUpperCase()) {
-          // Return the first task belonging to this user (tasks[0] is the user's task)
-          const task = req.tasks?.[0];
-          const taskNum: string = task?.['tm:number'] || task?.number || '';
-          if (taskNum) return taskNum;
+      if (user) {
+        const transports = await this.withSession(() => this.adtclient.userTransports(user)) as any;
+        const allRequests = (transports?.workbench ?? []).flatMap((t: any) =>
+          [...(t.modifiable ?? []), ...(t.released ?? [])]
+        );
+        for (const req of allRequests) {
+          const reqNum: string = req['tm:number'] || req.number || '';
+          if (reqNum.toUpperCase() === requestNumber.toUpperCase()) {
+            const task = req.tasks?.[0];
+            const taskNum: string = task?.['tm:number'] || task?.number || '';
+            if (taskNum) return taskNum;
+          }
         }
       }
     } catch (_) {}
-    return requestNumber; // unchanged if resolution fails
+
+    return requestNumber; // unchanged if both resolution methods fail
   }
 
   /**
