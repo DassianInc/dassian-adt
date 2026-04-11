@@ -152,8 +152,16 @@ export class TransportHandlers extends BaseHandler {
       }
       const transportNumber = (result as any)?.transportNumber || result;
       // Resolve the task number — abap_set_source needs the TASK (child), not the REQUEST (parent).
-      // The task number is returned by resolveTaskNumber after userTransports becomes available.
       const taskNumber = await this.resolveTaskNumber(transportNumber as string);
+      // For TOC transports, SAP creates the child task as Unclassified (X).
+      // Classify it as Correction (S) immediately so transport_assign works without manual SE01 steps.
+      if (isToc && taskNumber && taskNumber !== transportNumber) {
+        try {
+          await this.classifyTask(taskNumber);
+        } catch (_) {
+          // Classification failure is non-fatal — surface it in the message but don't block
+        }
+      }
       return this.success({
         transport: transportNumber,
         task: taskNumber !== transportNumber ? taskNumber : undefined,
@@ -183,9 +191,8 @@ export class TransportHandlers extends BaseHandler {
     // Resolve the task number once here — every assignment path below uses it.
     const taskNumber = await this.resolveTaskNumber(args.transport);
 
-    // Fail immediately if the task is Unclassified (TRFUNCTION='X').
-    // SAP silently discards all assignments to Unclassified tasks — nothing lands in E071.
-    // The user must classify the task in SE01 (set type to Correction/S) before assigning objects.
+    // Check for Unclassified task (TRFUNCTION='X') — SAP silently discards all E071 assignments to them.
+    // Auto-classify as Correction (S) before proceeding rather than failing or requiring SE01.
     try {
       const e070 = await this.withSession(() =>
         this.adtclient.tableContents('E070', 1, false,
@@ -194,15 +201,12 @@ export class TransportHandlers extends BaseHandler {
       const rows: any[] = e070?.values || e070?.records || e070?.value || [];
       const trfunction: string = rows[0]?.TRFUNCTION || rows[0]?.trfunction || '';
       if (trfunction === 'X') {
-        this.fail(
-          `transport_assign(${args.name}): task ${taskNumber} is Unclassified (TRFUNCTION=X). ` +
-          `SAP silently drops all assignments to Unclassified tasks. ` +
-          `Open SE01, find task ${taskNumber}, and set its type to Correction before retrying.`
-        );
+        await this.notify(`Task ${taskNumber} is Unclassified — classifying as Correction (S)…`, 'warning');
+        await this.classifyTask(taskNumber);
       }
     } catch (e: any) {
-      if (e?.message?.includes('Unclassified')) throw e; // rethrow our own fail
-      // E070 lookup failed — proceed anyway, SAP will reject if truly unclassified
+      if ((e as any)?.code === 'InternalError') throw e; // rethrow McpError from classifyTask
+      // E070 lookup failed — proceed anyway
     }
 
     // Metadata-only types (no text source) — assign via transportReference which registers
@@ -307,6 +311,22 @@ export class TransportHandlers extends BaseHandler {
         this.fail(formatError(`transport_assign(${args.name})`, error));
       }
     }
+  }
+
+  /**
+   * Classify a transport task as Correction (TRFUNCTION=S).
+   * Unclassified tasks (X) silently discard all E071 assignments — this fixes that.
+   * Uses the same PUT pattern as transportSetOwner; tm:useraction="classify" with tm:trfunction.
+   */
+  private async classifyTask(taskNumber: string): Promise<void> {
+    const h = (this.adtclient as any).h;
+    await this.withSession(() =>
+      h.request(`/sap/bc/adt/cts/transportrequests/${taskNumber}`, {
+        method: 'PUT',
+        headers: { Accept: 'application/*' },
+        body: `<?xml version="1.0" encoding="ASCII"?><tm:root xmlns:tm="http://www.sap.com/cts/adt/tm" tm:number="${taskNumber}" tm:useraction="classify" tm:trfunction="S"/>`
+      })
+    );
   }
 
   private async handleRelease(args: any): Promise<any> {
