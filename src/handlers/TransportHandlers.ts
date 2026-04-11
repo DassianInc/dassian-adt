@@ -179,6 +179,10 @@ export class TransportHandlers extends BaseHandler {
     if (!args.name || !args.type || !args.transport) {
       this.fail('transport_assign requires name (object name), type (e.g. CLAS, VIEW), and transport (request number).');
     }
+    // SAP E071 entries live under the TASK (child), not the REQUEST (parent).
+    // Resolve the task number once here — every assignment path below uses it.
+    const taskNumber = await this.resolveTaskNumber(args.transport);
+
     // Metadata-only types (no text source) — assign via transportReference which registers
     // the object on the transport directly without needing lock+read/write+unlock.
     // These types are containers or have no direct text source — assign via transportReference
@@ -187,11 +191,11 @@ export class TransportHandlers extends BaseHandler {
     const typeKey = args.type.toUpperCase().split('/')[0];
     const isMetadata = METADATA_TYPES.has(typeKey);
 
-    // transportReference: registers the TADIR key on the transport with no source manipulation.
-    // Used for known metadata types, unknown types, and as fallback when source path fails.
+    // transportReference: registers the TADIR key on the transport task with no source manipulation.
+    // Must use the TASK number — passing the request number results in silent no-ops.
     const doTransportReference = async (): Promise<void> => {
       await this.withSession(() =>
-        this.adtclient.transportReference('R3TR', typeKey, args.name.toUpperCase(), args.transport)
+        this.adtclient.transportReference('R3TR', typeKey, args.name.toUpperCase(), taskNumber)
       );
     };
 
@@ -199,9 +203,10 @@ export class TransportHandlers extends BaseHandler {
       try {
         await doTransportReference();
         return this.success({
-          message: `${args.name} assigned to transport ${args.transport}`,
+          message: `${args.name} assigned to transport ${args.transport} (task: ${taskNumber})`,
           name: args.name,
-          transport: args.transport
+          transport: args.transport,
+          task: taskNumber
         });
       } catch (error: any) {
         this.fail(formatError(`transport_assign(${args.name})`, error));
@@ -219,9 +224,10 @@ export class TransportHandlers extends BaseHandler {
       try {
         await doTransportReference();
         return this.success({
-          message: `${args.name} assigned to transport ${args.transport} (via reference — no ADT source path for type ${args.type})`,
+          message: `${args.name} assigned to transport ${args.transport} (task: ${taskNumber}, via reference — no ADT source path for type ${args.type})`,
           name: args.name,
-          transport: args.transport
+          transport: args.transport,
+          task: taskNumber
         });
       } catch (refError: any) {
         this.fail(formatError(`transport_assign(${args.name})`, refError));
@@ -237,9 +243,12 @@ export class TransportHandlers extends BaseHandler {
     const doAssign = async (): Promise<void> => {
       const lockResult = await this.adtclient.lock(objectUrl!);
       lockHandle = lockResult.LOCK_HANDLE;
+      // Prefer CORRNR from lock response (SAP's authoritative task number).
+      // Fall back to our pre-resolved taskNumber if CORRNR is empty.
+      const corrNr = lockResult.CORRNR || taskNumber;
       try {
         const currentSource = await this.adtclient.getObjectSource(sourceUrl);
-        await this.adtclient.setObjectSource(sourceUrl, currentSource as string, lockHandle!, args.transport);
+        await this.adtclient.setObjectSource(sourceUrl, currentSource as string, lockHandle!, corrNr);
       } catch (err: any) {
         try { await this.adtclient.unLock(objectUrl!, lockHandle!); } catch (_) {}
         lockHandle = null;
@@ -252,9 +261,10 @@ export class TransportHandlers extends BaseHandler {
     try {
       await this.withSession(doAssign);
       return this.success({
-        message: `${args.name} assigned to transport ${args.transport}`,
+        message: `${args.name} assigned to transport ${args.transport} (task: ${taskNumber})`,
         name: args.name,
-        transport: args.transport
+        transport: args.transport,
+        task: taskNumber
       });
     } catch (error: any) {
       if (lockHandle) {
@@ -265,9 +275,10 @@ export class TransportHandlers extends BaseHandler {
       try {
         await doTransportReference();
         return this.success({
-          message: `${args.name} assigned to transport ${args.transport} (via reference — source path failed: ${error?.message || error})`,
+          message: `${args.name} assigned to transport ${args.transport} (task: ${taskNumber}, via reference — source path failed: ${error?.message || error})`,
           name: args.name,
-          transport: args.transport
+          transport: args.transport,
+          task: taskNumber
         });
       } catch (_) {
         // Both paths failed — surface the original source error.
