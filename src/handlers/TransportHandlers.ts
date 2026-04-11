@@ -183,6 +183,28 @@ export class TransportHandlers extends BaseHandler {
     // Resolve the task number once here — every assignment path below uses it.
     const taskNumber = await this.resolveTaskNumber(args.transport);
 
+    // Fail immediately if the task is Unclassified (TRFUNCTION='X').
+    // SAP silently discards all assignments to Unclassified tasks — nothing lands in E071.
+    // The user must classify the task in SE01 (set type to Correction/S) before assigning objects.
+    try {
+      const e070 = await this.withSession(() =>
+        this.adtclient.tableContents('E070', 1, false,
+          `SELECT TRFUNCTION FROM E070 WHERE TRKORR = '${taskNumber.toUpperCase()}'`)
+      ) as any;
+      const rows: any[] = e070?.values || e070?.records || e070?.value || [];
+      const trfunction: string = rows[0]?.TRFUNCTION || rows[0]?.trfunction || '';
+      if (trfunction === 'X') {
+        this.fail(
+          `transport_assign(${args.name}): task ${taskNumber} is Unclassified (TRFUNCTION=X). ` +
+          `SAP silently drops all assignments to Unclassified tasks. ` +
+          `Open SE01, find task ${taskNumber}, and set its type to Correction before retrying.`
+        );
+      }
+    } catch (e: any) {
+      if (e?.message?.includes('Unclassified')) throw e; // rethrow our own fail
+      // E070 lookup failed — proceed anyway, SAP will reject if truly unclassified
+    }
+
     // Metadata-only types (no text source) — assign via transportReference which registers
     // the object on the transport directly without needing lock+read/write+unlock.
     // These types are containers or have no direct text source — assign via transportReference
