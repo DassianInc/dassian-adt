@@ -157,13 +157,13 @@ export class TransportHandlers extends BaseHandler {
       const transportNumber = (result as any)?.transportNumber || result;
       // Resolve the task number — abap_set_source needs the TASK (child), not the REQUEST (parent).
       const taskNumber = await this.resolveTaskNumber(transportNumber as string);
-      // For TOC transports, SAP creates the child task as Unclassified (X).
-      // Classify it as Correction (S) immediately so transport_assign works without manual SE01 steps.
-      if (isToc && taskNumber && taskNumber !== transportNumber) {
+      // SAP sometimes creates child tasks as Unclassified (X) — classify as Correction (S) always.
+      // Without this, transport_assign silently writes nothing to E071.
+      if (taskNumber && taskNumber !== transportNumber) {
         try {
           await this.classifyTask(taskNumber);
         } catch (_) {
-          // Classification failure is non-fatal — surface it in the message but don't block
+          // Classification failure is non-fatal — transport_assign will retry if needed
         }
       }
       return this.success({
@@ -215,11 +215,16 @@ export class TransportHandlers extends BaseHandler {
       const trfunction: string = rows[0]?.TRFUNCTION || rows[0]?.trfunction || '';
       if (trfunction === 'X') {
         await this.notify(`Task ${taskNumber} is Unclassified — classifying as Correction (S)…`, 'warning');
+        // Let classification failure propagate — if we can't classify, we must not proceed:
+        // assigning to an Unclassified task silently writes nothing to E071.
         await this.classifyTask(taskNumber);
+        await this.notify(`Task ${taskNumber} classified — proceeding with assignment…`);
       }
     } catch (e: any) {
-      if ((e as any)?.code === 'InternalError') throw e; // rethrow McpError from classifyTask
-      // E070 lookup failed — proceed anyway
+      // Rethrow anything that came from classifyTask or our own fail() calls
+      if (e?.message?.includes('classif') || e?.message?.includes('Unclassified') ||
+          (e as any)?.code === 'InternalError') throw e;
+      // E070 lookup itself failed — proceed and let SAP surface any task state errors naturally
     }
 
     // Metadata-only types (no text source) — assign via transportReference which registers
