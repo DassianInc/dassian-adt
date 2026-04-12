@@ -27,6 +27,7 @@ import { QualityHandlers }   from './handlers/QualityHandlers.js';
 import { GitHandlers }       from './handlers/GitHandlers.js';
 import { SystemHandlers }    from './handlers/SystemHandlers.js';
 import { renderLoginPage, renderLoginSuccess } from './auth/loginPage.js';
+import { resolveAuth } from './lib/auth.js';
 
 config({ path: path.resolve(__dirname, '../.env') });
 
@@ -121,16 +122,25 @@ export class AbapAdtServer extends Server {
       { capabilities: { tools: {}, logging: {}, prompts: {} } }
     );
 
-    const url = sapUrl || process.env.SAP_URL;
-    const user = sapUser || process.env.SAP_USER;
-    const pass = sapPassword || process.env.SAP_PASSWORD;
-    const client = sapClient || process.env.SAP_CLIENT;
-    const language = sapLanguage || process.env.SAP_LANGUAGE;
+    // If explicit credentials are provided (HTTP per-user mode), use them directly.
+    // Otherwise resolve from environment (supports basic, service key, and OAuth).
+    let url: string, user: string, password: string | (() => Promise<string>), client: string, language: string;
+    if (sapUrl && sapUser && sapPassword) {
+      url = sapUrl;
+      user = sapUser;
+      password = sapPassword;
+      client = sapClient ?? '';
+      language = sapLanguage ?? 'EN';
+    } else {
+      const auth = resolveAuth();
+      url = sapUrl || auth.url;
+      user = sapUser || auth.user;
+      password = sapPassword || auth.password;
+      client = sapClient ?? auth.client;
+      language = sapLanguage ?? auth.language;
+    }
 
-    if (!url) throw new Error('SAP_URL is required.');
-    if (!user || !pass) throw new Error('SAP_USER and SAP_PASSWORD are required.');
-
-    this.adtClient = new ADTClient(url, user, pass, client, language);
+    this.adtClient = new ADTClient(url, user, password, client, language);
     this.adtClient.stateful = session_types.stateful;
 
     this.sourceHandlers    = new SourceHandlers(this.adtClient);
