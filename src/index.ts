@@ -26,6 +26,8 @@ import { DataHandlers }      from './handlers/DataHandlers.js';
 import { QualityHandlers }   from './handlers/QualityHandlers.js';
 import { GitHandlers }       from './handlers/GitHandlers.js';
 import { SystemHandlers }    from './handlers/SystemHandlers.js';
+import { TestHandlers }      from './handlers/TestHandlers.js';
+import { RapHandlers }       from './handlers/RapHandlers.js';
 import { resolveSystemConfigs, AuthConfig } from './lib/auth.js';
 import type { BaseHandler } from './handlers/BaseHandler.js';
 
@@ -130,6 +132,8 @@ function createSystemEntry(
     new QualityHandlers(client),
     new GitHandlers(client),
     new SystemHandlers(client),
+    new TestHandlers(client),
+    new RapHandlers(client),
   ];
 
   for (const h of handlers) {

@@ -102,6 +102,23 @@ export class QualityHandlers extends BaseHandler {
           },
           required: ['name', 'type', 'line', 'column']
         }
+      },
+      {
+        name: 'abap_fix_proposals',
+        description:
+          'Get ADT quick-fix proposals for a syntax error at a specific position. ' +
+          'Workflow: run abap_syntax_check → get error line/column → call this tool → apply the chosen fix with abap_write. ' +
+          'Returns a list of proposed fixes with descriptions and the exact source changes to apply.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name:   { type: 'string', description: 'Object name' },
+            type:   { type: 'string', description: 'Object type (e.g. CLAS, PROG/P)' },
+            line:   { type: 'number', description: 'Line number of the error (from syntax check result)' },
+            column: { type: 'number', description: 'Column number of the error (from syntax check result)' }
+          },
+          required: ['name', 'type', 'line', 'column']
+        }
       }
     ];
   }
@@ -113,6 +130,7 @@ export class QualityHandlers extends BaseHandler {
       case 'abap_atc_variants':    return this.handleAtcVariants(args);
       case 'abap_where_used':      return this.handleWhereUsed(args);
       case 'abap_find_definition': return this.handleFindDefinition(args);
+      case 'abap_fix_proposals':   return this.handleFixProposals(args);
       default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
   }
@@ -400,6 +418,51 @@ export class QualityHandlers extends BaseHandler {
       });
     } catch (error: any) {
       this.fail(formatError(`abap_find_definition(${args.name})`, error));
+    }
+  }
+
+  private async handleFixProposals(args: any): Promise<any> {
+    try {
+      const sourceUrl = buildSourceUrl(args.name, args.type);
+      const source = await this.withSession(() =>
+        this.adtclient.getObjectSource(sourceUrl)
+      ) as string;
+
+      const proposals = await this.withSession(() =>
+        this.adtclient.fixProposals(sourceUrl, source, args.line, args.column)
+      );
+
+      if (!proposals || proposals.length === 0) {
+        return this.success({ name: args.name, proposals: [], note: 'No quick-fix proposals available at this position.' });
+      }
+
+      // For each proposal, fetch the actual edits so Claude can apply them directly
+      const withEdits = await Promise.all(proposals.map(async (p: any) => {
+        try {
+          const deltas = await this.withSession(() =>
+            this.adtclient.fixEdits(p, source)
+          );
+          return {
+            description: p['adtcore:description'] || p['adtcore:name'],
+            uri: p['adtcore:uri'],
+            changes: deltas.map((d: any) => ({
+              uri: d.uri,
+              range: d.range,
+              newContent: d.content
+            }))
+          };
+        } catch {
+          return {
+            description: p['adtcore:description'] || p['adtcore:name'],
+            uri: p['adtcore:uri'],
+            changes: []
+          };
+        }
+      }));
+
+      return this.success({ name: args.name, proposalCount: withEdits.length, proposals: withEdits });
+    } catch (error: any) {
+      this.fail(formatError(`abap_fix_proposals(${args.name})`, error));
     }
   }
 }
