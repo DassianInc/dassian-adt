@@ -183,33 +183,46 @@ export class TransportHandlers extends BaseHandler {
     const description: string = args.description.length > 60
       ? args.description.slice(0, 60)
       : args.description;
-    // ADTClient.createTransport hardcodes OPERATION="I" (Workbench/K).
-    // For Transport of Copies (TOC), bypass it and call the lower-level function with OPERATION="T".
+    // ADTClient.createTransport posts to /sap/bc/adt/cts/transports with
+    // dataname=com.sap.adt.CreateCorrectionRequest — that content type always creates
+    // a Workbench (K) regardless of any OPERATION parameter.
+    // For a Transport of Copies (TOC), we create a Workbench request first, then
+    // immediately reclassify the request header to TRFUNCTION='T' via PUT/classify.
     const isToc = args.transportType === 'toc';
     try {
-      let result: any;
-      if (isToc) {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const transportApi = require('abap-adt-api/build/api/transports.js');
-        const h = (this.adtclient as any).h;
-        result = await this.withSession(() =>
-          transportApi.createTransport(h, sourceUrl, description, devclass, 'T')
-        );
-      } else {
-        result = await this.withSession(() =>
-          this.adtclient.createTransport(sourceUrl, description, devclass)
-        );
-      }
+      const result = await this.withSession(() =>
+        this.adtclient.createTransport(sourceUrl, description, devclass)
+      );
       const transportNumber = (result as any)?.transportNumber || result;
+
+      if (isToc) {
+        // Reclassify the REQUEST header from K (Workbench) to T (Transport of Copies).
+        // TOCs don't have child tasks — objects are assigned directly on the request.
+        const h = (this.adtclient as any).h;
+        await this.withSession(() =>
+          h.request(`/sap/bc/adt/cts/transportrequests/${transportNumber}`, {
+            method: 'PUT',
+            headers: { Accept: 'application/*' },
+            body: `<?xml version="1.0" encoding="ASCII"?><tm:root xmlns:tm="http://www.sap.com/cts/adt/tm" tm:number="${transportNumber}" tm:useraction="classify" tm:trfunction="T"/>`
+          })
+        );
+        return this.success({
+          transport: transportNumber,
+          message:
+            `TOC ${transportNumber} created. ` +
+            `Objects go directly on the request — pass ${transportNumber} (not a task) to transport_assign.`
+        });
+      }
+
       // Resolve the task number — abap_set_source needs the TASK (child), not the REQUEST (parent).
       const taskNumber = await this.resolveTaskNumber(transportNumber as string);
-      // Workbench transports sometimes get child tasks created as Unclassified (X) on certain systems.
-      // Classify as Correction (S) immediately — TOC tasks don't have this problem.
-      if (!isToc && taskNumber && taskNumber !== transportNumber) {
+      // Workbench tasks sometimes get created as Unclassified (X) on certain systems.
+      // Classify as Correction (S) immediately.
+      if (taskNumber && taskNumber !== transportNumber) {
         try {
           await this.classifyTask(taskNumber);
         } catch (_) {
-          // Classification failure is non-fatal — transport_assign will retry if needed
+          // Non-fatal — transport_assign will re-classify if needed
         }
       }
       return this.success({
