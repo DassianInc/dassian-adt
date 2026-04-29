@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/dassianinc-dassian-adt-badge.png)](https://mseep.ai/app/dassianinc-dassian-adt)
+
 # dassian-adt
 
 MCP server for SAP ABAP development via the ADT API. Connect AI assistants to your SAP system — read, write, test, and deploy ABAP code without SAP GUI.
