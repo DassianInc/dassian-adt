@@ -155,6 +155,50 @@ export class TransportHandlers extends BaseHandler {
           },
           required: ['transport']
         }
+      },
+      {
+        name: 'transport_log',
+        annotations: { readOnlyHint: true },
+        description:
+          'Read the CTS import/activation log for a transport on a specific system. ' +
+          'Returns the raw log showing programs generated/activated, syntax errors, ' +
+          'return codes, and timestamps for every import run of that transport. ' +
+          'IMPORTANT: call this on the system where the log lives — e.g. sap_system_id=c22 ' +
+          'to read C22 logs, sap_system_id=d25 for D25 GT5K* transports. ' +
+          'The "system" parameter is the SAP system name that appears in the log filename (e.g. "C22", "D25"). ' +
+          'Common acttypes — try in this order if one returns nothing: ' +
+          '"G" (default) = ABAP generation, "A" = activation, "I" = main import, ' +
+          '"J" = DDIC activation, "H" = ABAP Dictionary import, "R" = after-import methods/XPRAs, ' +
+          '"B" = inactive import, "<" = forward to follow-on system. ' +
+          'The acttype letter replaces position 4 of the transport number in the log filename (e.g. GT5K… → GT5A… for acttype A).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            trkorr:  { type: 'string', description: 'Transport request number, e.g. X22K904025 or GT5K900123' },
+            system:  { type: 'string', description: 'SAP system name for the log file, e.g. C22, D25, C23' },
+            client:  { type: 'string', description: 'SAP client number (default: 100)' },
+            acttype: { type: 'string', description: 'Log file action type (default: G = program generation). Use I for import phase.' }
+          },
+          required: ['trkorr', 'system']
+        }
+      },
+      {
+        name: 'transport_find',
+        annotations: { readOnlyHint: true },
+        description:
+          'Search for transport requests by description fragment. ' +
+          'Queries E07T on the connected system — use the target system (e.g. sap_system_id=d25) ' +
+          'to find GT5K* transports created there by gCTS, or sap_system_id=x22 to find source transports. ' +
+          'Useful for locating the GT5K transport number that corresponds to a GitHub issue or Jira key.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query:  { type: 'string', description: 'Text to search in transport description, e.g. "DSNMANN-571" or "FPA Adjustment"' },
+            owner:  { type: 'string', description: 'Filter by transport owner/user (optional)' },
+            prefix: { type: 'string', description: 'Filter by transport number prefix, e.g. "GT5K" for D25 gCTS transports' }
+          },
+          required: ['query']
+        }
       }
     ];
   }
@@ -170,6 +214,8 @@ export class TransportHandlers extends BaseHandler {
       case 'transport_delete':    return this.handleDelete(args);
       case 'transport_set_owner': return this.handleSetOwner(args);
       case 'transport_add_user':  return this.handleAddUser(args);
+      case 'transport_log':       return this.handleLog(args);
+      case 'transport_find':      return this.handleFind(args);
       default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
   }
@@ -409,27 +455,13 @@ export class TransportHandlers extends BaseHandler {
         const msg = (firstError?.message || '').toLowerCase();
         if (msg.includes('task') && (msg.includes('not yet released') || msg.includes('referencing'))) {
           // Parent request can't release yet — find and release its tasks first.
-          // userTransports gives us the full request→task structure.
-          const user = (this.adtclient as any).username || (this.adtclient as any).h?.username;
-          const transports = await this.withSession(() =>
-            this.adtclient.userTransports(user)
+          // Query E070 directly (fast) instead of userTransports (slow on large systems).
+          const e070 = await this.withSession(() =>
+            this.adtclient.tableContents('E070', 20, false,
+              `SELECT trkorr FROM e070 WHERE strkorr = '${args.transport.toUpperCase()}' AND trstatus = 'D'`)
           ) as any;
-
-          // Walk workbench targets to find the request and extract its tasks
-          const tasks: string[] = [];
-          const allRequests = (transports?.workbench ?? []).flatMap((t: any) =>
-            [...(t.modifiable ?? []), ...(t.released ?? [])]
-          );
-          for (const req of allRequests) {
-            const reqNum: string = req['tm:number'] || req.number || '';
-            if (reqNum.toUpperCase() === args.transport.toUpperCase()) {
-              for (const task of (req.tasks ?? [])) {
-                const taskNum: string = task['tm:number'] || task.number || '';
-                if (taskNum) tasks.push(taskNum);
-              }
-              break;
-            }
-          }
+          const rows: any[] = e070?.values || e070?.records || e070?.value || [];
+          const tasks: string[] = rows.map((r: any) => r.TRKORR || r.trkorr).filter(Boolean);
 
           for (const task of tasks) {
             await this.notify(`Releasing task ${task}…`);
@@ -454,31 +486,58 @@ export class TransportHandlers extends BaseHandler {
    * via the underlying HTTP client with a minimal <tm:root> body.
    */
   private async releaseOne(transportNumber: string, ignoreAtc: boolean): Promise<any> {
-    try {
-      // ADTClient.transportRelease(number, ignoreLocks, IgnoreATC)
-      // Pass false for ignoreLocks; use ignoreAtc for the 3rd param.
+    const h = (this.adtclient as any).h;
+    const action = ignoreAtc ? 'relObjigchkatc' : 'newreleasejobs';
+
+    // When ignoreAtc=true the ADT library generates a blank transport number in the URL.
+    // Always use the raw HTTP path — it works on all systems and avoids the library bug.
+    if (ignoreAtc) {
       return await this.withSession(() =>
-        this.adtclient.transportRelease(transportNumber, false, ignoreAtc)
+        h.request(`/sap/bc/adt/cts/transportrequests/${transportNumber}/${action}`, {
+          method: 'POST',
+          headers: { Accept: 'application/*', 'Content-Type': 'application/xml' },
+          body: `<tm:root xmlns:tm="http://www.sap.com/cts/adt/tm"/>`
+        })
       );
+    }
+
+    try {
+      // ADTClient.transportRelease(number, ignoreLocks, ignoreAtc)
+      const result = await this.withSession(() =>
+        this.adtclient.transportRelease(transportNumber, false, false)
+      );
+      this.assertReleaseSucceeded(result);
+      return result;
     } catch (err: any) {
       const msg = (err?.message || '').toLowerCase();
-      // Older SAP systems return "System expected the element '{...tm}root'" when the POST body
-      // is empty — they require a minimal <tm:root> XML body.
+      // Older SAP systems (S/4 2022) require an XML body on the POST — retry with one.
       if (msg.includes('expected the element') || msg.includes('tm}root') || msg.includes('tm:root')) {
-        const h = (this.adtclient as any).h;
-        const action = ignoreAtc ? 'relObjigchkatc' : 'newreleasejobs';
-        return await this.withSession(() =>
+        const retryResult = await this.withSession(() =>
           h.request(`/sap/bc/adt/cts/transportrequests/${transportNumber}/${action}`, {
             method: 'POST',
-            headers: {
-              Accept: 'application/*',
-              'Content-Type': 'application/xml'
-            },
+            headers: { Accept: 'application/*', 'Content-Type': 'application/xml' },
             body: `<tm:root xmlns:tm="http://www.sap.com/cts/adt/tm"/>`
           })
         );
+        this.assertReleaseSucceeded(retryResult);
+        return retryResult;
       }
       throw err;
+    }
+  }
+
+  // ADT returns abortrelapifail (not a thrown error) when tasks are unreleased or other
+  // soft failures occur. Throw so callers can catch and handle (e.g. auto-release tasks).
+  private assertReleaseSucceeded(result: any): void {
+    const items: any[] = Array.isArray(result) ? result : [result];
+    const item = items[0] || {};
+    const status: string = item['chkrun:status'] || '';
+    if (status.includes('fail') || status.includes('abort')) {
+      const msgs: string = (item.messages || [])
+        .map((m: any) => m['chkrun:shortText'])
+        .filter(Boolean)
+        .join('; ');
+      throw new Error(msgs || item['chkrun:statusText'] || `Release failed: ${status}`);
     }
   }
 
@@ -569,6 +628,138 @@ export class TransportHandlers extends BaseHandler {
       return this.success({ transport: args.transport, user: args.user, result });
     } catch (error: any) {
       this.fail(formatError(`transport_add_user(${args.transport})`, error));
+    }
+  }
+
+  private async handleLog(args: any): Promise<any> {
+    const trkorr  = String(args.trkorr  || '').toUpperCase().trim();
+    const system  = String(args.system  || '').toUpperCase().trim();
+    const client  = String(args.client  || '100').trim();
+    const acttype = String(args.acttype || 'G').trim().charAt(0).toUpperCase();
+
+    if (!/^[A-Z0-9]{10,20}$/.test(trkorr)) {
+      this.fail(`transport_log: invalid trkorr "${args.trkorr}" — expected transport number like X22K904025 (10 chars) or GT5KB1E8TJCMBE00SUEB (20-char gCTS ID).`);
+    }
+    if (!/^[A-Z0-9]{2,4}$/.test(system)) {
+      this.fail(`transport_log: invalid system "${args.system}" — expected 2-4 character SAP system ID like C22 or D25.`);
+    }
+    if (!/^\d{1,3}$/.test(client)) {
+      this.fail(`transport_log: invalid client "${args.client}" — expected 1-3 digit number.`);
+    }
+
+    const methodBody = `
+DATA lt_lines TYPE TABLE OF trlog.
+DATA lv_file  TYPE tstrf01-file.
+DATA lv_fname TYPE tstrf01-filename.
+
+CALL FUNCTION 'STRF_SETNAME_PROT'
+  EXPORTING
+    acttype  = '${acttype}'
+    dirtype  = 'T'
+    sysname  = '${system}'
+    trkorr   = '${trkorr}'
+  IMPORTING
+    file     = lv_file
+    filename = lv_fname
+  EXCEPTIONS
+    wrong_call = 1.
+
+IF sy-subrc <> 0.
+  out->write( 'STRF_SETNAME_PROT failed - check acttype/dirtype' ).
+  RETURN.
+ENDIF.
+
+CALL FUNCTION 'TR_READ_LOG'
+  EXPORTING
+    iv_log_type     = 'FILE'
+    iv_logname_file = lv_file
+    iv_client       = '${client}'
+  TABLES
+    et_lines        = lt_lines
+  EXCEPTIONS
+    invalid_input = 1
+    access_error  = 2
+    OTHERS        = 3.
+
+IF sy-subrc <> 0.
+  out->write( |Log file not found: { lv_file }| ).
+  out->write( 'The transport may not have been imported on this system, or try a different acttype (e.g. I).' ).
+ELSE.
+  out->write( |=== { lv_fname } ({ lines( lt_lines ) } lines) ===| ).
+  LOOP AT lt_lines INTO DATA(ls).
+    out->write( ls-line ).
+  ENDLOOP.
+ENDIF.
+`;
+
+    try {
+      const output = await this.runClassrun(methodBody, 'ZCL_TMP_TR_LOG');
+      return this.success({ trkorr, system, client, acttype, log: output });
+    } catch (error: any) {
+      this.fail(formatError(`transport_log(${trkorr}/${system})`, error));
+    }
+  }
+
+  private async handleFind(args: any): Promise<any> {
+    const query  = String(args.query  || '').trim();
+    const owner  = String(args.owner  || '').toUpperCase().trim();
+    const prefix = String(args.prefix || '').toUpperCase().trim();
+
+    if (!query) this.fail('transport_find: query is required.');
+    if (query.includes("'") || owner.includes("'") || prefix.includes("'")) {
+      this.fail('transport_find: parameters must not contain single quotes.');
+    }
+
+    const prefixClause = prefix ? `AND trkorr LIKE '${prefix}%'` : '';
+    const ownerClause  = owner  ? `AND as4user = '${owner}'`    : '';
+
+    // E07T has: trkorr, sprsl/langu, as4text (description only)
+    // E070 has: trkorr, as4user, as4date, as4time, trstatus
+    // Use a local TYPES struct — SELECT with partial field list maps positionally,
+    // so TYPE TABLE OF e07t would put as4text into the sprsl/langu field.
+    const methodBody = `
+TYPES: BEGIN OF ty_e07t_row,
+         trkorr  TYPE e07t-trkorr,
+         as4text TYPE e07t-as4text,
+       END OF ty_e07t_row.
+DATA lt_e07t TYPE TABLE OF ty_e07t_row.
+DATA ls_e07t TYPE ty_e07t_row.
+DATA ls_e070  TYPE e070.
+DATA lv_count TYPE i.
+
+SELECT trkorr as4text
+  FROM e07t
+  INTO TABLE lt_e07t
+  WHERE as4text LIKE '%${query}%'
+    ${prefixClause}.
+
+SORT lt_e07t BY trkorr DESCENDING.
+DELETE ADJACENT DUPLICATES FROM lt_e07t COMPARING trkorr.
+DELETE lt_e07t FROM 50.
+
+lv_count = 0.
+LOOP AT lt_e07t INTO ls_e07t.
+  CLEAR ls_e070.
+  SELECT SINGLE trkorr as4user as4date as4time trstatus
+    FROM e070
+    INTO CORRESPONDING FIELDS OF ls_e070
+    WHERE trkorr = ls_e07t-trkorr
+    ${ownerClause}.
+  IF sy-subrc = 0.
+    out->write( |{ ls_e07t-trkorr } { ls_e070-as4date } { ls_e070-as4user } [{ ls_e070-trstatus }]: { ls_e07t-as4text }| ).
+    lv_count = lv_count + 1.
+  ENDIF.
+ENDLOOP.
+IF lv_count = 0.
+  out->write( 'No transports found.' ).
+ENDIF.
+`;
+
+    try {
+      const output = await this.runClassrun(methodBody, 'ZCL_TMP_TR_FIND');
+      return this.success({ query, owner, prefix, results: output });
+    } catch (error: any) {
+      this.fail(formatError(`transport_find(${query})`, error));
     }
   }
 

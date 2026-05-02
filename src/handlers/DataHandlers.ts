@@ -13,7 +13,11 @@ export class DataHandlers extends BaseHandler {
         description:
           'Execute a SQL query against the SAP database via ADT. ' +
           'Use OpenSQL syntax (FROM clause, WHERE, ORDER BY). ' +
-          'For complex data investigations, prefer abap_run which gives full ABAP logic.',
+          'For complex data investigations, prefer abap_run which gives full ABAP logic. ' +
+          'NOTE: "Invalid query string. Only SELECT statement is allowed." errors come from the SAP ADT ' +
+          'endpoint itself — not from client-side validation. This can occur for tables with special ' +
+          'characters in names (e.g. /UI5/FILE), cluster tables, or views not accessible via the ' +
+          'datapreview endpoint. In these cases, use abap_run with a SELECT INTO TABLE statement instead.',
         inputSchema: {
           type: 'object',
           properties: {

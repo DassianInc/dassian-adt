@@ -173,16 +173,6 @@ export function formatError(operation: string, error: any): string {
     );
   }
 
-  // Any unclassified HTTP 400 is suspicious — real bad-requests from SAP have descriptive messages
-  // that are caught above. A 400 that falls through here may be a session drop that withSession
-  // didn't catch (unexpected message shape from SAP). Always hint to re-login.
-  if (info.httpStatus === 400) {
-    return (
-      `${operation} failed: ${info.message} ` +
-      `(HTTP 400 — if this is unexpected, the session may have dropped. Call login() to re-authenticate and retry.)`
-    );
-  }
-
   return `${operation} failed: ${info.message}`;
 }
 

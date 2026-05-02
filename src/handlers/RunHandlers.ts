@@ -3,6 +3,23 @@ import { BaseHandler } from './BaseHandler.js';
 import { session_types } from 'abap-adt-api';
 import type { ToolDefinition } from '../types/tools.js';
 import { formatError } from '../lib/errors.js';
+import { randomUUID } from 'crypto';
+
+// ── Output pagination store ───────────────────────────────────────────────────
+// Stores large abap_run outputs split into PAGE_SIZE chunks, keyed by run_id.
+// Entries expire after PAGE_TTL_MS so memory doesn't grow unbounded.
+const PAGE_SIZE    = 60_000;   // chars per page
+const PAGE_TTL_MS  = 30 * 60 * 1000; // 30 minutes
+
+interface PagedRun { pages: string[]; created: number; className: string }
+const pagedRuns = new Map<string, PagedRun>();
+
+function evictExpiredRuns(): void {
+  const now = Date.now();
+  for (const [id, run] of pagedRuns) {
+    if (now - run.created > PAGE_TTL_MS) pagedRuns.delete(id);
+  }
+}
 
 export class RunHandlers extends BaseHandler {
   getTools(): ToolDefinition[] {
@@ -37,7 +54,14 @@ export class RunHandlers extends BaseHandler {
           'Use "SELECT * FROM table INTO TABLE lt WHERE ..." (old-style, no inline @DATA) — ' +
           'inline declarations with UP TO N ROWS do not work inside this method. ' +
           'To limit rows, use "DELETE lt FROM N." after the SELECT. ' +
-          'If the class name already exists from a previous failed run, pass a different className.',
+          'LARGE OUTPUT: When the method produces more than 60 000 characters, output is automatically ' +
+          'split into pages. The first page is returned with run_id, total_pages, and has_more=true. ' +
+          'Use abap_fetch_page(run_id, page) to retrieve subsequent pages (retained for 30 minutes). ' +
+          'If the class name already exists from a previous failed run it is deleted and retried automatically. ' +
+          'KNOWN LIMITATION: HTTP calls from within abap_run code to http://localhost/... will fail with ' +
+          'ICMECONNREFUSED — the ABAP process cannot reach the ICM listener via loopback. ' +
+          'Use CL_HTTP_CLIENT=>CREATE_BY_DESTINATION with a configured RFC destination instead, ' +
+          'or use the dedicated bsp_read_file / bsp_search_content tools to read BSP/UI5 file content.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -60,16 +84,60 @@ export class RunHandlers extends BaseHandler {
           },
           required: ['methodBody']
         }
+      },
+      {
+        name: 'abap_fetch_page',
+        annotations: { readOnlyHint: true },
+        description:
+          'Retrieve a subsequent page of output from a large abap_run result. ' +
+          'When abap_run output exceeds 60 000 characters it is automatically split into pages. ' +
+          'The first page is returned inline with the run result along with a run_id and total_pages. ' +
+          'Call abap_fetch_page with that run_id and the desired page number to retrieve additional pages. ' +
+          'Pages are retained for 30 minutes after the run.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            run_id:   { type: 'string', description: 'The run_id returned by abap_run when output was paginated.' },
+            page:     { type: 'number', description: 'Page number to retrieve (1-based).' }
+          },
+          required: ['run_id', 'page']
+        }
       }
     ];
   }
 
   async handle(toolName: string, args: any): Promise<any> {
     switch (toolName) {
-      case 'abap_unlock': return this.handleUnlock(args);
-      case 'abap_run':    return this.handleRun(args);
+      case 'abap_unlock':     return this.handleUnlock(args);
+      case 'abap_run':        return this.handleRun(args);
+      case 'abap_fetch_page': return this.handleFetchPage(args);
       default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
+  }
+
+  private handleFetchPage(args: any): any {
+    evictExpiredRuns();
+    const runId = (args.run_id || '').trim();
+    const page  = Math.floor(args.page ?? 1);
+
+    const run = pagedRuns.get(runId);
+    if (!run) {
+      this.fail(`abap_fetch_page: run_id "${runId}" not found — it may have expired (30-minute TTL) or never existed.`);
+    }
+
+    const idx = page - 1;
+    if (idx < 0 || idx >= run!.pages.length) {
+      this.fail(`abap_fetch_page: page ${page} out of range (1–${run!.pages.length}) for run_id "${runId}".`);
+    }
+
+    return this.success({
+      run_id:       runId,
+      page,
+      total_pages:  run!.pages.length,
+      has_more:     page < run!.pages.length,
+      className:    run!.className,
+      output:       run!.pages[idx]
+    });
   }
 
   private async handleUnlock(args: any): Promise<any> {
@@ -134,29 +202,6 @@ export class RunHandlers extends BaseHandler {
     return this.handleRun({ methodBody, className: 'ZCL_TMP_UNLOCK' });
   }
 
-  private buildClassSource(className: string, methodBody: string, methodName: string): string {
-    const body = methodBody || '';
-    const indented = body.split('\n').map(line => `    ${line}`).join('\n');
-    return `CLASS ${className} DEFINITION
-  PUBLIC
-  FINAL
-  CREATE PUBLIC.
-
-  PUBLIC SECTION.
-    INTERFACES if_oo_adt_classrun.
-  PROTECTED SECTION.
-  PRIVATE SECTION.
-ENDCLASS.
-
-CLASS ${className} IMPLEMENTATION.
-
-  METHOD if_oo_adt_classrun~${methodName}.
-${indented}
-  ENDMETHOD.
-
-ENDCLASS.`;
-  }
-
   private async handleRun(args: any): Promise<any> {
     // Accept 'code' as an alias for 'methodBody'
     if (args.code && !args.methodBody) args.methodBody = args.code;
@@ -164,9 +209,10 @@ ENDCLASS.`;
       this.fail('abap_run: methodBody is required — provide the ABAP code to run as the methodBody parameter.');
     }
 
-    const className = (args.className || 'ZCL_TMP_ADT_RUN').toUpperCase();
-    const classUrl = `/sap/bc/adt/oo/classes/${className.toLowerCase()}`;
-    const sourceUrl = `${classUrl}/source/main`;
+    const className     = (args.className || 'ZCL_TMP_ADT_RUN').toUpperCase();
+    let actualClassName = className;
+    let classUrl        = `/sap/bc/adt/oo/classes/${className.toLowerCase()}`;
+    let sourceUrl       = `${classUrl}/source/main`;
 
     let methodName: string = 'run';
     let classCreated = false;
@@ -194,42 +240,53 @@ ENDCLASS.`;
         }
       }
 
-      // Create temp class in $TMP — if it already exists (leftover from failed run), offer to clean up
-      try {
-        await this.adtclient.createObject(
-          'CLAS/OC',
-          className,
-          '$TMP',
-          'Temporary ADT runner class',
-          '/sap/bc/adt/packages/%24tmp',
-          undefined,
-          undefined
-        );
-      } catch (createErr: any) {
-        const msg = (createErr?.message || '').toLowerCase();
-        if (msg.includes('already exists') || msg.includes('exists already')) {
-          const deleteIt = await this.confirmWithUser(
-            `Class ${className} already exists (leftover from a previous failed run). Delete it and retry?`,
-            { className }
+      // Create temp class in $TMP.
+      // If it already exists (leftover from a failed run), delete it and retry automatically.
+      // If that also fails, try incrementing the name suffix (ZCL_TMP_ADT_RUN_2, _3, ...) up to 5 times.
+      const tryCreate = async (name: string): Promise<boolean> => {
+        try {
+          await this.adtclient.createObject(
+            'CLAS/OC', name, '$TMP', 'Temporary ADT runner class',
+            '/sap/bc/adt/packages/%24tmp', undefined, undefined
           );
-          if (deleteIt) {
-            try {
-              const delLock = await this.adtclient.lock(classUrl);
-              if (delLock.CORRNR) { try { await this.classifyTask(delLock.CORRNR); } catch (_) {} }
-              await this.adtclient.deleteObject(classUrl, delLock.LOCK_HANDLE);
-            } catch (_) {}
-            // Retry creation
-            await this.adtclient.createObject(
-              'CLAS/OC', className, '$TMP', 'Temporary ADT runner class',
-              '/sap/bc/adt/packages/%24tmp', undefined, undefined
-            );
-          } else {
-            this.fail(`abap_run: ${className} already exists. Pass a different className (e.g. className="ZCL_TMP_RUN2").`);
+          return true;
+        } catch (e: any) {
+          const m = (e?.message || '').toLowerCase();
+          if (m.includes('already exist') || m.includes('exists already')) return false;
+          throw e;
+        }
+      };
+
+      const deleteStale = async (name: string): Promise<void> => {
+        const url = `/sap/bc/adt/oo/classes/${name.toLowerCase()}`;
+        try {
+          const delLock = await this.adtclient.lock(url);
+          if (delLock.CORRNR) { try { await this.classifyTask(delLock.CORRNR); } catch (_) {} }
+          await this.adtclient.deleteObject(url, delLock.LOCK_HANDLE);
+        } catch (_) {}
+      };
+
+      if (!await tryCreate(actualClassName)) {
+        // Stale class exists — try to clean it up and re-create
+        await deleteStale(actualClassName);
+        if (!await tryCreate(actualClassName)) {
+          // Deletion didn't work (locked by another user?) — try suffixed names
+          let created = false;
+          for (let i = 2; i <= 6; i++) {
+            const alt = `${className}_${i}`;
+            if (await tryCreate(alt)) { actualClassName = alt; created = true; break; }
           }
-        } else {
-          throw createErr;
+          if (!created) {
+            this.fail(
+              `abap_run: ${className} already exists and could not be cleaned up. ` +
+              `Pass a different className or delete the class manually in Eclipse.`
+            );
+          }
         }
       }
+      // Update outer vars so catch/finally and subsequent steps use the resolved name
+      classUrl  = `/sap/bc/adt/oo/classes/${actualClassName.toLowerCase()}`;
+      sourceUrl = `${classUrl}/source/main`;
       classCreated = true;
 
       // Lock → write source → unlock
@@ -240,14 +297,14 @@ ENDCLASS.`;
         try { await this.classifyTask(lockResult.CORRNR); } catch (_) {}
       }
 
-      const source = this.buildClassSource(className, args.methodBody, methodName);
+      const source = this.buildClassSource(actualClassName, args.methodBody, methodName);
       await this.adtclient.setObjectSource(sourceUrl, source, lockHandle);
 
       await this.adtclient.unLock(classUrl, lockHandle);
       lockHandle = null;
 
       // Activate — if it fails because the method name is wrong for this release, surface a clear hint
-      const activationResult = await this.adtclient.activate(className, classUrl);
+      const activationResult = await this.adtclient.activate(actualClassName, classUrl);
       // Surface the raw activation result so callers can diagnose unexpected shapes (e.g. release differences)
       const activationSucceeded = activationResult?.success === true;
       if (!activationSucceeded) {
@@ -284,7 +341,7 @@ ENDCLASS.`;
       let output: any;
       try {
         const response = await h.request(
-          `/sap/bc/adt/oo/classrun/${className.toUpperCase()}`,
+          `/sap/bc/adt/oo/classrun/${actualClassName.toUpperCase()}`,
           { method: 'POST', headers: { Accept: 'text/plain' } }
         );
         output = response.body ?? response.data ?? '';
@@ -319,7 +376,30 @@ ENDCLASS.`;
         throw new Error(`classrun returned error in body (HTTP 200): ${outputStr}${hint}`);
       }
 
-      return this.success({ output, className });
+      // Paginate large output: split into PAGE_SIZE chunks, cache server-side, return page 1.
+      // abap_fetch_page(run_id, page) retrieves subsequent pages (30-minute TTL).
+      evictExpiredRuns();
+      if (outputStr.length > PAGE_SIZE) {
+        const pages: string[] = [];
+        for (let off = 0; off < outputStr.length; off += PAGE_SIZE) {
+          pages.push(outputStr.slice(off, off + PAGE_SIZE));
+        }
+        const runId = randomUUID();
+        pagedRuns.set(runId, { pages, created: Date.now(), className: actualClassName });
+        return this.success({
+          output:       pages[0],
+          className:    actualClassName,
+          paginated:    true,
+          run_id:       runId,
+          page:         1,
+          total_pages:  pages.length,
+          total_chars:  outputStr.length,
+          has_more:     pages.length > 1,
+          note:         `Output split into ${pages.length} pages. Use abap_fetch_page(run_id="${runId}", page=N) to retrieve remaining pages.`
+        });
+      }
+
+      return this.success({ output: outputStr, className: actualClassName });
 
     } catch (error: any) {
       if (lockHandle) {

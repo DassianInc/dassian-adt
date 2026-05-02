@@ -243,6 +243,84 @@ export class ObjectHandlers extends BaseHandler {
       }
     }
 
+    // DOMA/DTEL: the ADT REST endpoint rejects creates with "An exception was raised"
+    // regardless of Content-Type. Use ABAP FMs (DDIF_DOMA_PUT / DDIF_DTEL_PUT) via
+    // classrun instead — more reliable and works across all S/4 releases.
+    if (typeKey === 'DOMA' || typeKey === 'DTEL') {
+      const nameUpper = args.name.toUpperCase();
+      const safeDesc = (args.description || '').replace(/'/g, "''");
+      const pkg = args.package.toUpperCase();
+      const transport = (args.transport || '').toUpperCase();
+
+      let methodBody: string;
+      if (typeKey === 'DOMA') {
+        methodBody = `
+DATA ls_dd01v TYPE dd01v.
+ls_dd01v-domname  = '${nameUpper}'.
+ls_dd01v-ddtext   = '${safeDesc}'.
+ls_dd01v-datatype = 'CHAR'.
+ls_dd01v-leng     = 1.
+
+CALL FUNCTION 'DDIF_DOMA_PUT'
+  EXPORTING
+    name     = '${nameUpper}'
+    dd01v_wa = ls_dd01v
+  EXCEPTIONS
+    put_failure = 1
+    put_refused = 2
+    OTHERS      = 3.
+
+IF sy-subrc <> 0.
+  out->write( |DDIF_DOMA_PUT failed: sy-subrc = { sy-subrc }| ).
+ELSE.
+  out->write( 'OK' ).
+ENDIF.
+`;
+      } else {
+        methodBody = `
+DATA ls_dd04v TYPE dd04v.
+ls_dd04v-rollname = '${nameUpper}'.
+ls_dd04v-ddtext   = '${safeDesc}'.
+ls_dd04v-datatype = 'CHAR'.
+ls_dd04v-leng     = 1.
+
+CALL FUNCTION 'DDIF_DTEL_PUT'
+  EXPORTING
+    name     = '${nameUpper}'
+    dd04v_wa = ls_dd04v
+  EXCEPTIONS
+    put_failure = 1
+    put_refused = 2
+    OTHERS      = 3.
+
+IF sy-subrc <> 0.
+  out->write( |DDIF_DTEL_PUT failed: sy-subrc = { sy-subrc }| ).
+ELSE.
+  out->write( 'OK' ).
+ENDIF.
+`;
+      }
+
+      try {
+        const output = await this.runClassrun(methodBody, 'ZCL_TMP_DDIC_CREATE');
+        if (!output.includes('OK')) {
+          this.fail(`abap_create(${nameUpper}): ${output.trim() || 'FM returned non-zero sy-subrc'}`);
+        }
+        const typeName = typeKey === 'DOMA' ? 'Domain' : 'Data element';
+        return this.success({
+          message:
+            `${typeName} ${nameUpper} created in inactive state. ` +
+            (transport ? `Assign to transport ${transport} with transport_assign, then ` : '') +
+            `use abap_get_source / abap_set_source to set the full definition, then abap_activate.`,
+          name: nameUpper,
+          type: typeKey,
+          package: pkg
+        });
+      } catch (error: any) {
+        this.fail(formatError(`abap_create(${nameUpper})`, error));
+      }
+    }
+
     // BDEF requires a custom Content-Type (application/vnd.sap.adt.blues.v1+xml) that the
     // library's createObject does not support. Bypass it and call the ADT endpoint directly.
     if (typeKey === 'BDEF') {

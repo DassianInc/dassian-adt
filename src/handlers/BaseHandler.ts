@@ -358,6 +358,121 @@ export abstract class BaseHandler {
     );
   }
 
+  /** Build the ABAP source for a temporary IF_OO_ADT_CLASSRUN class. */
+  protected buildClassSource(className: string, methodBody: string, methodName: string): string {
+    const indented = (methodBody || '').split('\n').map(line => `    ${line}`).join('\n');
+    return `CLASS ${className} DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC.
+
+  PUBLIC SECTION.
+    INTERFACES if_oo_adt_classrun.
+  PROTECTED SECTION.
+  PRIVATE SECTION.
+ENDCLASS.
+
+CLASS ${className} IMPLEMENTATION.
+
+  METHOD if_oo_adt_classrun~${methodName}.
+${indented}
+  ENDMETHOD.
+
+ENDCLASS.`;
+  }
+
+  /**
+   * Create a temporary ABAP classrun, execute methodBody, delete the class, return the output.
+   * Shared by any handler that needs to run arbitrary ABAP without exposing abap_run to the LLM.
+   * Does NOT paginate — callers are responsible for keeping output manageable.
+   */
+  protected async runClassrun(methodBody: string, className = 'ZCL_TMP_ADT_RUN'): Promise<string> {
+    const upperName = className.toUpperCase();
+    const classUrl  = `/sap/bc/adt/oo/classes/${upperName.toLowerCase()}`;
+    const sourceUrl = `${classUrl}/source/main`;
+    let classCreated = false;
+    let lockHandle: string | null = null;
+
+    this.adtclient.stateful = session_types.stateful;
+    await this.adtclient.login();
+
+    let methodName = 'run';
+    try {
+      const ifSource = await this.adtclient.getObjectSource(
+        '/sap/bc/adt/oo/interfaces/if_oo_adt_classrun/source/main'
+      ) as string;
+      methodName = ifSource.toLowerCase().includes('main') ? 'main' : 'run';
+    } catch (_) {}
+
+    try {
+      const tryCreate = async (): Promise<boolean> => {
+        try {
+          await this.adtclient.createObject(
+            'CLAS/OC', upperName, '$TMP', 'Temporary runner',
+            '/sap/bc/adt/packages/%24tmp'
+          );
+          return true;
+        } catch (e: any) {
+          const m = (e?.message || '').toLowerCase();
+          if (m.includes('already exist') || m.includes('exists already')) return false;
+          throw e;
+        }
+      };
+
+      if (!await tryCreate()) {
+        try {
+          const dl = await this.adtclient.lock(classUrl);
+          if (dl.CORRNR) { try { await this.classifyTask(dl.CORRNR); } catch (_) {} }
+          await this.adtclient.deleteObject(classUrl, dl.LOCK_HANDLE);
+        } catch (_) {}
+        if (!await tryCreate()) {
+          throw new Error(`${upperName} already exists and could not be cleaned up — pass a different className.`);
+        }
+      }
+      classCreated = true;
+
+      const lr = await this.adtclient.lock(classUrl);
+      lockHandle = lr.LOCK_HANDLE;
+      if (lr.CORRNR) { try { await this.classifyTask(lr.CORRNR); } catch (_) {} }
+      await this.adtclient.setObjectSource(sourceUrl, this.buildClassSource(upperName, methodBody, methodName), lockHandle);
+      await this.adtclient.unLock(classUrl, lockHandle);
+      lockHandle = null;
+
+      const activation = await this.adtclient.activate(upperName, classUrl);
+      if (activation?.success !== true) {
+        const msgs = (activation?.messages || []).map((m: any) => m.shortText || m.objDescr).filter(Boolean).join('; ');
+        throw new Error(`Activation failed: ${msgs || JSON.stringify(activation)}`);
+      }
+
+      await this.adtclient.logout();
+      this.adtclient.stateful = session_types.stateless;
+      await this.adtclient.login();
+
+      const h = (this.adtclient as any).h;
+      const response = await h.request(
+        `/sap/bc/adt/oo/classrun/${upperName}`,
+        { method: 'POST', headers: { Accept: 'text/plain' } }
+      );
+      const output = String(response.body ?? response.data ?? '');
+      if (output.startsWith('Error:') || output.startsWith('Exception:')) {
+        throw new Error(`classrun returned error: ${output}`);
+      }
+      return output;
+
+    } finally {
+      if (lockHandle) { try { await this.adtclient.unLock(classUrl, lockHandle); } catch (_) {} }
+      if (classCreated) {
+        try {
+          this.adtclient.stateful = session_types.stateful;
+          await this.adtclient.login();
+          const dl = await this.adtclient.lock(classUrl);
+          if (dl.CORRNR) { try { await this.classifyTask(dl.CORRNR); } catch (_) {} }
+          await this.adtclient.deleteObject(classUrl, dl.LOCK_HANDLE);
+        } catch (_) {}
+      }
+    }
+  }
+
   /**
    * Validate required parameters from the tool schema, then dispatch to the handler.
    * This prevents "Cannot read properties of undefined" crashes by checking required

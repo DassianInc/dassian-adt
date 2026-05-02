@@ -15,6 +15,7 @@ import {
 import { ADTClient, session_types } from 'abap-adt-api';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { randomUUID, createHash } from 'crypto';
+import { readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { URL } from 'url';
 
@@ -31,6 +32,8 @@ import { RapHandlers }       from './handlers/RapHandlers.js';
 import { TraceHandlers }     from './handlers/TraceHandlers.js';
 import { DdicHandlers }      from './handlers/DdicHandlers.js';
 import { resolveSystemConfigs, AuthConfig } from './lib/auth.js';
+import { logToolError, extractRawResponse } from './lib/logger.js';
+import { parseAdtError } from './lib/errors.js';
 import type { BaseHandler } from './handlers/BaseHandler.js';
 
 config({ path: path.resolve(__dirname, '../.env') });
@@ -284,6 +287,22 @@ export class AbapAdtServer extends Server {
         if (tools.includes(name)) {
           try {
             const result = await handler.validateAndHandle(name, args);
+            // Log soft failures (activation errors, batch failures) returned as success:false / activated:false
+            try {
+              const text = result?.content?.[0]?.text
+                ?? JSON.stringify(result, (_, v) => typeof v === 'bigint' ? v.toString() : v);
+              const parsed = JSON.parse(text);
+              if (parsed.activated === false || parsed.success === false) {
+                const msgs: string[] = parsed.messages || parsed.errors || [];
+                logToolError({
+                  tool: name,
+                  system: systemId,
+                  error_type: 'soft_failure',
+                  message: msgs.join(' | ') || 'Tool returned failure',
+                  args
+                });
+              }
+            } catch (_) {}
             if (result?.content) return result;
             return {
               content: [{
@@ -292,6 +311,24 @@ export class AbapAdtServer extends Server {
               }]
             };
           } catch (error: any) {
+            const info = parseAdtError(error);
+            const errorType = info.isSessionTimeout   ? 'session_timeout'
+                            : info.isLocked           ? 'locked'
+                            : info.isNotFound         ? 'not_found'
+                            : info.isUpgradeMode      ? 'upgrade_mode'
+                            : info.isLockNotSupported ? 'lock_not_supported'
+                            :                           'internal';
+            const raw = info.httpStatus === 400 ? extractRawResponse(error) : {};
+            logToolError({
+              tool: name,
+              system: systemId,
+              error_type: errorType,
+              message: error.message || 'Unknown error',
+              http_status: info.httpStatus,
+              args,
+              raw_headers: raw.headers,
+              raw_body: raw.body
+            });
             if (error instanceof McpError) throw error;
             throw new McpError(ErrorCode.InternalError, error.message || 'Unknown error');
           }
@@ -340,11 +377,42 @@ interface PendingCode {
   expiresAt: number;
 }
 
+const TOKEN_TTL_MS  = 30 * 24 * 3600 * 1000; // 30 days
+const TOKEN_FILE    = process.env.TOKEN_FILE || '/home/mcp-tokens.json';
+
+interface IssuedToken { session: OAuthSession; expiresAt: number; }
+
+function loadTokensFromDisk(): Map<string, IssuedToken> {
+  const map = new Map<string, IssuedToken>();
+  try {
+    const raw = readFileSync(TOKEN_FILE, 'utf-8');
+    const stored: Record<string, IssuedToken> = JSON.parse(raw);
+    const now = Date.now();
+    for (const [tok, entry] of Object.entries(stored)) {
+      if (entry.expiresAt > now) map.set(tok, entry);
+    }
+    console.error(`[TOKENS] Loaded ${map.size} valid token(s) from disk`);
+  } catch { /* file absent or corrupt — start fresh */ }
+  return map;
+}
+
+function saveTokensToDisk(tokens: Map<string, IssuedToken>): void {
+  try {
+    const obj: Record<string, IssuedToken> = {};
+    for (const [tok, entry] of tokens) obj[tok] = entry;
+    writeFileSync(TOKEN_FILE, JSON.stringify(obj), 'utf-8');
+  } catch (e) { console.error(`[TOKENS] Failed to persist tokens: ${e}`); }
+}
+
 const pendingCodes = new Map<string, PendingCode>();
-const issuedTokens = new Map<string, OAuthSession>();
+const issuedTokens = loadTokensFromDisk();
+
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of pendingCodes) if (v.expiresAt < now) pendingCodes.delete(k);
+  let expired = 0;
+  for (const [k, v] of issuedTokens) if (v.expiresAt < now) { issuedTokens.delete(k); expired++; }
+  if (expired > 0) { console.error(`[TOKENS] Purged ${expired} expired token(s)`); saveTokensToDisk(issuedTokens); }
 }, 600_000);
 
 function escHtml(s: string): string {
@@ -462,7 +530,8 @@ interface HttpSession {
 
 async function runHttp() {
   const port     = parseInt(process.env.PORT || process.env.MCP_HTTP_PORT || '3000', 10);
-  const mcpPath  = process.env.MCP_HTTP_PATH || '/mcp';
+  const mcpPath  = process.env.MCP_HTTP_PATH || '/';
+  console.error(`[CONFIG] PORT=${port} MCP_HTTP_PATH=${mcpPath} MCP_AUTH_MODE=${process.env.MCP_AUTH_MODE}`);
   // MCP_AUTH_MODE:
   //   service (default) — all sessions use SAP_SYSTEMS service account credentials, no OAuth
   //   oauth             — OAuth login required; users supply their own SAP credentials
@@ -517,11 +586,15 @@ async function runHttp() {
       return;
     }
 
+    // Log all requests for OAuth debugging
+    console.error(`[REQ] ${req.method} ${reqUrl.pathname}${reqUrl.search || ''} | auth:${(req.headers['authorization']||'').slice(0,20)||'none'}`);
+
     // ── OAuth: protected resource metadata ─────────────────────────────────
     if (reqUrl.pathname === '/.well-known/oauth-protected-resource') {
       const base = `https://${req.headers.host}`;
+      const resource = mcpPath === '/' ? base : `${base}${mcpPath}`;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ resource: `${base}${mcpPath}`, authorization_servers: [base] }));
+      res.end(JSON.stringify({ resource, authorization_servers: [base] }));
       return;
     }
 
@@ -533,9 +606,36 @@ async function runHttp() {
         issuer: base,
         authorization_endpoint: `${base}/oauth/authorize`,
         token_endpoint: `${base}/oauth/token`,
+        registration_endpoint: `${base}/oauth/register`,
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code'],
-        code_challenge_methods_supported: ['S256', 'plain'],
+        code_challenge_methods_supported: ['S256'],
+        token_endpoint_auth_methods_supported: ['none'],
+        scopes_supported: [],
+        client_id_metadata_document_supported: true,
+      }));
+      return;
+    }
+
+    // ── OAuth: Dynamic Client Registration ─────────────────────────────────
+    if (reqUrl.pathname === '/oauth/register' && req.method === 'POST') {
+      const body = await readBody(req);
+      const ct = req.headers['content-type'] || '';
+      let reg: any = {};
+      try { reg = ct.includes('application/json') ? JSON.parse(body) : Object.fromEntries(new URLSearchParams(body)); }
+      catch { /* leave reg empty */ }
+      const clientId = typeof reg.client_id === 'string' && reg.client_id ? reg.client_id : randomUUID();
+      console.error(`[DCR] register client_id=${clientId} redirect_uris=${JSON.stringify(reg.redirect_uris || [])}`);
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        client_id: clientId,
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        redirect_uris: reg.redirect_uris || [],
+        grant_types: ['authorization_code'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+        ...(reg.client_name ? { client_name: reg.client_name } : {}),
+        ...(reg.client_uri  ? { client_uri:  reg.client_uri  } : {}),
       }));
       return;
     }
@@ -597,16 +697,36 @@ async function runHttp() {
       const dest = new URL(redirectUri);
       dest.searchParams.set('code', code);
       if (state) dest.searchParams.set('state', state);
-      res.writeHead(302, { Location: dest.toString() });
-      res.end();
+      console.error(`[AUTH] redirect_uri=${redirectUri} state=${state ? state.slice(0,12)+'...' : 'MISSING'} callback=${dest.toString().slice(0,80)}`);
+      const callbackUrlJs = JSON.stringify(dest.toString()); // safe for JS string — do NOT escHtml here
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Authenticated</title>
+<style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f0f2f5}
+.card{background:#fff;border-radius:10px;box-shadow:0 2px 16px rgba(0,0,0,.1);padding:40px;text-align:center;max-width:400px}
+h2{color:#111;margin-bottom:8px}p{color:#666;font-size:14px}</style>
+</head><body>
+<div class="card">
+  <h2>&#x2713; Authenticated</h2>
+  <p>Returning to Claude Code&hellip;</p>
+</div>
+<script>
+window.location.href = ${callbackUrlJs};
+</script>
+</body></html>`);
       return;
     }
 
     // ── OAuth: token exchange ───────────────────────────────────────────────
     if (reqUrl.pathname === '/oauth/token' && req.method === 'POST') {
-      const form         = new URLSearchParams(await readBody(req));
-      const code         = form.get('code')          || '';
-      const codeVerifier = form.get('code_verifier') || '';
+      const rawBody = await readBody(req);
+      const ct = req.headers['content-type'] || '';
+      let tok: any = {};
+      try { tok = ct.includes('application/json') ? JSON.parse(rawBody) : Object.fromEntries(new URLSearchParams(rawBody)); }
+      catch { /* leave tok empty */ }
+      const code         = String(tok.code          || '');
+      const codeVerifier = String(tok.code_verifier || '');
+      console.error(`[TOKEN] code=${code.slice(0,8)}... verifier=${codeVerifier ? 'present' : 'absent'} ct=${ct.split(';')[0]}`);
       const pending      = pendingCodes.get(code);
 
       if (!pending || pending.expiresAt < Date.now()) {
@@ -626,10 +746,11 @@ async function runHttp() {
 
       pendingCodes.delete(code);
       const token = randomUUID();
-      issuedTokens.set(token, pending.session);
+      issuedTokens.set(token, { session: pending.session, expiresAt: Date.now() + TOKEN_TTL_MS });
+      saveTokensToDisk(issuedTokens);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ access_token: token, token_type: 'bearer', expires_in: 86400 }));
+      res.end(JSON.stringify({ access_token: token, token_type: 'Bearer', expires_in: TOKEN_TTL_MS / 1000 }));
       return;
     }
 
@@ -645,9 +766,14 @@ async function runHttp() {
     const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
     let sessionAuth: [AuthConfig[], string] | null = null;
 
+    const apiKey = process.env.MCP_API_KEY;
     if (bearerToken && issuedTokens.has(bearerToken)) {
-      const s = issuedTokens.get(bearerToken)!;
-      sessionAuth = [s.authConfigs, s.defaultId];
+      const entry = issuedTokens.get(bearerToken)!;
+      if (entry.expiresAt > Date.now()) {
+        sessionAuth = [entry.session.authConfigs, entry.session.defaultId];
+      }
+    } else if (apiKey && bearerToken === apiKey && authConfigs.length > 0) {
+      sessionAuth = [authConfigs, defaultId];
     } else if ((authMode === 'service' || authMode === 'hybrid') && authConfigs.length > 0) {
       sessionAuth = [authConfigs, defaultId];
     }
@@ -666,7 +792,10 @@ async function runHttp() {
 
     // ── Existing session ────────────────────────────────────────────────────
     if (sessionId && sessions.has(sessionId)) {
-      await sessions.get(sessionId)!.transport.handleRequest(req, res);
+      const rawBody = await readBody(req);
+      let parsedBody: unknown;
+      try { parsedBody = rawBody ? JSON.parse(rawBody) : undefined; } catch { /* not JSON */ }
+      await sessions.get(sessionId)!.transport.handleRequest(req, res, parsedBody);
       return;
     }
 
@@ -677,22 +806,37 @@ async function runHttp() {
     }
 
     // ── New session ─────────────────────────────────────────────────────────
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
-    const server    = new AbapAdtServer(sessionAuth);
-    await server.connect(transport);
+    try {
+      const rawBody = await readBody(req);
+      let parsedBody: unknown;
+      try { parsedBody = rawBody ? JSON.parse(rawBody) : undefined; } catch { /* not JSON */ }
+      console.error(`[MCP-INIT] ${req.method} ct:${(req.headers['content-type']||'').split(';')[0]} body:${rawBody.slice(0,300)}`);
 
-    transport.onclose = () => {
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+      const server    = new AbapAdtServer(sessionAuth!);
+      await server.connect(transport);
+
+      transport.onclose = () => {
+        if (transport.sessionId) {
+          sessions.delete(transport.sessionId);
+          console.error(`[HTTP] Session closed: ${transport.sessionId} (${sessions.size} active)`);
+        }
+      };
+
+      await transport.handleRequest(req, res, parsedBody);
+
       if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
-        console.error(`[HTTP] Session closed: ${transport.sessionId} (${sessions.size} active)`);
+        sessions.set(transport.sessionId, { transport, server });
+        console.error(`[HTTP] New session: ${transport.sessionId} (${sessions.size} active)`);
+      } else {
+        console.error(`[MCP-INIT] No session ID — transport did not initialize (method=${req.method})`);
       }
-    };
-
-    await transport.handleRequest(req, res);
-
-    if (transport.sessionId) {
-      sessions.set(transport.sessionId, { transport, server });
-      console.error(`[HTTP] New session: ${transport.sessionId} (${sessions.size} active)`);
+    } catch (err: any) {
+      console.error(`[MCP-INIT] Error: ${err?.message || err}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Internal error', message: err?.message }));
+      }
     }
   });
 

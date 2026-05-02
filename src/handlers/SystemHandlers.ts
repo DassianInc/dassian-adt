@@ -66,6 +66,8 @@ export class SystemHandlers extends BaseHandler {
           '(1) SITO objects (require Content-Type: application/json for source writes), ' +
           '(2) SICF path management, ' +
           '(3) Any ADT endpoint not exposed as a dedicated tool. ' +
+          'NOTE: BSP/UI5 filestore paths (/sap/bc/adt/filestore/ui5-bsp/...) are NOT accessible via raw_http — ' +
+          'use the dedicated bsp_read_file and bsp_search_content tools for reading BSP application files. ' +
           'For SITO source writes: method=PUT, path=/sap/bc/adt/ddls/SITO_NAME/source/main?lockHandle=LOCK, ' +
           'contentType=application/json, body=<JSON source>. ' +
           'HARD RULE — NEVER use raw_http to POST to lock endpoints (?method=adtLock) or attempt to ' +

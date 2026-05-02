@@ -123,6 +123,36 @@ Adding a type that breaks on lock/write (e.g., generates inactive includes) to `
 
 `index.ts` defines 4 built-in prompts callable as slash commands: `fix-atc`, `transport-review`, `class-overview`, `release-transport`. These are multi-step ABAP workflows pre-scripted as MCP prompt messages. Add new ones to the `PROMPTS` array.
 
+## Deployment
+
+The server runs in two modes:
+- **Stdio** — local Claude Code integration (one process per SAP system config)
+- **HTTP streaming** — `dassian-adt-mcp` Azure App Service (East US 2, `rg-dsn-ai`), used by claude.ai
+
+### Deploy to Azure App Service
+
+```bash
+npm run build
+zip -r /tmp/dassian-adt.zip dist package.json node_modules -x "node_modules/.cache/*"
+az webapp deploy --resource-group rg-dsn-ai --name dassian-adt-mcp --src-path /tmp/dassian-adt.zip --type zip
+```
+
+Deployment takes ~60 seconds. The App Service URL is `https://dassian-adt-mcp.azurewebsites.net`.
+
+### Pull the Error Log
+
+Errors are appended to `/home/LogFiles/dassian-adt-errors.jsonl` on the App Service (persistent Azure Files mount, survives redeploys). Kudu basic auth is disabled — use an ARM bearer token:
+
+```bash
+TOKEN=$(az account get-access-token --resource "https://management.azure.com/" --query accessToken -o tsv)
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://dassian-adt-mcp.scm.azurewebsites.net/api/vfs/LogFiles/dassian-adt-errors.jsonl"
+```
+
+Each line is a JSON record: `{ ts, tool, system, error_type, message, http_status, args }`. The `args` field captures the input parameters with long strings truncated to 120 chars. Error types: `session_timeout`, `locked`, `not_found`, `upgrade_mode`, `lock_not_supported`, `soft_failure`, `internal`.
+
+Locally (stdio mode) errors go to `~/.dassian-adt/errors.jsonl`. Override either path with `ADT_ERROR_LOG` env var.
+
 ## Test Structure
 
 Unit tests (`src/__tests__/unit/`) test `urlBuilder.ts` and `errors.ts` exhaustively and `BaseHandler` validation — no mocking of `adtclient`. Integration and E2E tests require live SAP connection via environment variables (`SAP_URL`, `SAP_USER`, `SAP_PASSWORD`, `SAP_CLIENT`).
