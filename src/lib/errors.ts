@@ -29,6 +29,21 @@ export function parseAdtError(error: any): AdtErrorInfo {
     error?.message ||
     'Unknown error';
 
+  // AdtErrorException from the library carries extra context that SAP returned alongside
+  // the generic message (e.g. when message is just "An exception was raised", the localizedMessage
+  // and properties bag often contain the actual reason). Append them if present.
+  const localized: string = error?.localizedMessage || '';
+  const propsBag = error?.properties || {};
+  const propStr: string = Object.keys(propsBag).length
+    ? Object.entries(propsBag).map(([k, v]) => `${k}=${v}`).join('; ')
+    : '';
+  if (localized && !rawMessage.includes(localized)) {
+    rawMessage = `${rawMessage} — ${localized}`;
+  }
+  if (propStr) {
+    rawMessage = `${rawMessage} [${propStr}]`;
+  }
+
   // SAP ADT returns "I::000" (or similar X::NNN format) when the ADT resource URL is wrong
   // for the object type — typically means "container object has no source endpoint" or "wrong path".
   if (/^[A-Z]+::\d+$/.test(rawMessage.trim())) {

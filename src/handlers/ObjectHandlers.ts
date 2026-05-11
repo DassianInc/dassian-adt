@@ -175,68 +175,107 @@ export class ObjectHandlers extends BaseHandler {
     const createType = ObjectHandlers.CREATE_TYPE_MAP[typeKey] || args.type;
     const packageUrl = buildPackageUrl(args.package);
 
-    // DEVC (package) creation requires software component and transport layer — the library's
-    // createObject sends a minimal XML that SAP rejects with "incomplete data". We look up
-    // those values from the parent package and POST the full XML directly.
+    // DEVC (package): the ADT REST endpoint returns "An exception was raised" with no detail,
+    // and the abap-adt-api library's createObject can't supply software_component / transport_layer.
+    // Use CL_PACKAGE_FACTORY=>CREATE_NEW_PACKAGE via classrun — that gives us full control and
+    // clear sy-subrc / message values when something fails.
     if (typeKey === 'DEVC') {
       try {
-        const h = (this.adtclient as any).h;
-        const username = ((h.username || 'UNKNOWN') as string).toUpperCase();
-
-        // Derive software component and transport layer from parent package
-        const parentEncoded = args.package.replace(/\//g, '%2f').replace(/\$/g, '%24').toLowerCase();
-        let softwareComponent = '';
-        let transportLayer = '';
-        try {
-          const parentResp = await this.withSession(() =>
-            h.request(`/sap/bc/adt/packages/${parentEncoded}`, { method: 'GET', headers: { Accept: 'application/xml' } })
-          );
-          const parentXml: string = (parentResp as any).body || '';
-          const scMatch = parentXml.match(/pak:softwareComponent[^/]*pak:name="([^"]+)"/);
-          const tlMatch = parentXml.match(/pak:transportLayer[^/]*pak:name="([^"]+)"/);
-          if (scMatch) softwareComponent = scMatch[1];
-          if (tlMatch) transportLayer = tlMatch[1];
-        } catch (_) {
-          // Parent lookup failed — proceed with empty SC/TL and let SAP validate.
-          // $TMP and other local packages legitimately have no software component or transport layer.
-        }
-
-        const escDesc = (args.description || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         const nameUpper = args.name.toUpperCase();
-        const packageUpper = args.package.toUpperCase();
-        const nameEncoded = nameUpper.replace(/\//g, '%2f').replace(/\$/g, '%24').toLowerCase();
-        const body =
-          `<?xml version="1.0" encoding="utf-8"?>\n` +
-          `<pak:package\n` +
-          `  adtcore:responsible="${username}"\n` +
-          `  adtcore:masterLanguage="EN"\n` +
-          `  adtcore:name="${nameUpper}"\n` +
-          `  adtcore:description="${escDesc}"\n` +
-          `  xmlns:pak="http://www.sap.com/adt/packages"\n` +
-          `  xmlns:adtcore="http://www.sap.com/adt/core">\n` +
-          `  <pak:attributes pak:packageType="development"/>\n` +
-          `  <pak:superPackage adtcore:name="${packageUpper}"/>\n` +
-          `  <pak:applicationComponent pak:name=""/>\n` +
-          `  <pak:transport>\n` +
-          `    <pak:softwareComponent pak:name="${softwareComponent}"/>\n` +
-          `    <pak:transportLayer pak:name="${transportLayer}"/>\n` +
-          `  </pak:transport>\n` +
-          `</pak:package>`;
-        const qs: any = {};
-        if (args.transport) qs.corrNr = args.transport;
-        await this.withSession(() =>
-          h.request(`/sap/bc/adt/packages/${nameEncoded}`, {
-            method: 'POST', body, qs,
-            headers: { 'Content-Type': 'application/vnd.sap.adt.package+xml' }
-          })
-        );
+        const parentUpper = args.package.toUpperCase();
+        const transport = (args.transport || '').toUpperCase();
+        const safeDesc = (args.description || '').replace(/'/g, "''").slice(0, 60);
+        const safeName = nameUpper.replace(/'/g, "''");
+        const safeParent = parentUpper.replace(/'/g, "''");
+        const transportClause = transport
+          ? `i_transport_request = '${transport.replace(/'/g, "''")}'`
+          : `i_transport_request = ''`;
+
+        const methodBody = `
+DATA: lo_pkg    TYPE REF TO if_package,
+      lo_root_x TYPE REF TO cx_root,
+      ls_data   TYPE scompkdtln,
+      ls_tdevc  TYPE tdevc.
+
+" Look up software component (dlvunit) and transport layer (pdevclass) from parent.
+SELECT SINGLE dlvunit pdevclass FROM tdevc
+  INTO (ls_data-dlvunit, ls_data-pdevclass)
+  WHERE devclass = '${safeParent}'.
+IF sy-subrc <> 0.
+  out->write( |Parent package ${safeParent} not found in TDEVC| ).
+  RETURN.
+ENDIF.
+
+ls_data-devclass   = '${safeName}'.
+ls_data-ctext      = '${safeDesc}'.
+ls_data-as4user    = sy-uname.
+ls_data-parentcl   = '${safeParent}'.
+ls_data-masterlang = sy-langu.
+ls_data-packtype   = 'D'.
+
+TRY.
+    cl_package_factory=>create_new_package(
+      EXPORTING
+        i_reuse_deleted_object  = abap_true
+        i_suppress_dialog       = abap_true
+      IMPORTING
+        e_package               = lo_pkg
+      CHANGING
+        c_package_data          = ls_data
+      EXCEPTIONS
+        object_already_existing    = 1
+        object_just_created        = 2
+        not_authorized             = 3
+        wrong_name_prefix          = 4
+        undefined_name             = 5
+        reserved_local_name        = 6
+        invalid_package_name       = 7
+        short_text_missing         = 8
+        software_component_invalid = 9
+        layer_invalid              = 10
+        author_not_existing        = 11
+        component_not_existing     = 12
+        component_missing          = 13
+        prefix_in_use              = 14
+        unexpected_error           = 15
+        intern_err                 = 16
+        no_access                  = 17
+        invalid_translation_depth  = 18
+        wrong_mainpack_value       = 19
+        superpackage_invalid       = 20
+        error_in_cts_checks        = 21
+        OTHERS                     = 22 ).
+
+    IF sy-subrc <> 0.
+      out->write( |create_new_package sy-subrc={ sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 } { sy-msgv2 } { sy-msgv3 } { sy-msgv4 }| ).
+    ELSE.
+      lo_pkg->save(
+        EXPORTING
+          i_suppress_dialog   = abap_true
+          ${transportClause}
+        EXCEPTIONS
+          OTHERS              = 1 ).
+      IF sy-subrc <> 0.
+        out->write( |save sy-subrc={ sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 } { sy-msgv2 } { sy-msgv3 } { sy-msgv4 }| ).
+      ELSE.
+        out->write( 'OK' ).
+      ENDIF.
+    ENDIF.
+
+  CATCH cx_root INTO lo_root_x.
+    out->write( |Exception: { lo_root_x->get_text( ) }| ).
+ENDTRY.
+`;
+
+        const output = await this.runClassrun(methodBody, 'ZCL_TMP_PKG_CREATE');
+        if (!output.includes('OK')) {
+          this.fail(`abap_create(${nameUpper}): ${output.trim() || 'package factory returned non-zero sy-subrc'}`);
+        }
         return this.success({
-          message: `Created package ${args.name} under ${args.package} (${softwareComponent} / ${transportLayer}).`,
-          name: args.name,
+          message: `Created package ${nameUpper} under ${parentUpper}${transport ? ` on transport ${transport}` : ''} (software component and transport layer inherited from parent).`,
+          name: nameUpper,
           type: 'DEVC',
-          package: args.package,
-          softwareComponent,
-          transportLayer
+          package: parentUpper
         });
       } catch (error: any) {
         this.fail(formatError(`abap_create(${args.name})`, error));
