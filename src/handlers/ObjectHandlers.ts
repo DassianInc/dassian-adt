@@ -28,7 +28,8 @@ export class ObjectHandlers extends BaseHandler {
             package: { type: 'string', description: 'Package name, e.g. $TMP or /DSN/CORE. Also accepted as "devclass".' },
             devclass: { type: 'string', description: 'Alias for package.' },
             description: { type: 'string', description: 'Short description shown in ABAP Workbench' },
-            transport: { type: 'string', description: 'Transport number. Required for non-$TMP packages.' }
+            transport: { type: 'string', description: 'Transport number. Required for non-$TMP packages.' },
+            rowType: { type: 'string', description: 'For type=TTYP only: line type (a DDIC structure or data element), e.g. /DSN/BIL_S_RET_SHARE. Required for TTYP.' }
           },
           required: ['name', 'type', 'description']
         }
@@ -354,6 +355,124 @@ ENDIF.
           name: nameUpper,
           type: typeKey,
           package: pkg
+        });
+      } catch (error: any) {
+        this.fail(formatError(`abap_create(${nameUpper})`, error));
+      }
+    }
+
+    // TTYP (table type): same situation as DOMA/DTEL — the ADT REST endpoint returns
+    // "An exception was raised", the library doesn't have TTYP/DA in its CreatableTypes,
+    // and RS_CORR_INSERT rejects TTYP names as "wrong syntax" (it auto-converts to LIMU).
+    // Use DDIF_TTYP_PUT for the DDIC structure, then INSERT INTO TADIR (and E071 if a
+    // transport is provided) directly.
+    if (typeKey === 'TTYP') {
+      const nameUpper = args.name.toUpperCase();
+      const pkg = args.package.toUpperCase();
+      const transport = (args.transport || '').toUpperCase();
+      const rowType = (args.rowType || '').toUpperCase();
+      const safeDesc = (args.description || '').replace(/'/g, "''").slice(0, 60);
+
+      if (!rowType) {
+        this.fail(
+          `abap_create(${nameUpper}): TTYP requires a rowType arg — pass the DDIC structure or data element ` +
+          `to use as the line type, e.g. rowType="/DSN/BIL_S_RET_SHARE".`
+        );
+      }
+
+      const safeName = nameUpper.replace(/'/g, "''");
+      const safeRowType = rowType.replace(/'/g, "''");
+      const safePkg = pkg.replace(/'/g, "''");
+      const safeTransport = transport.replace(/'/g, "''");
+
+      // Step 1 DDIF_TTYP_PUT to put the inactive DDIC version.
+      // Step 2 INSERT INTO TADIR with the requested package.
+      // Step 3 If a transport is provided AND the package is not $TMP, add an E071 entry to
+      //        the user's open task in that request. We look up the task via E070.
+      const methodBody = `
+DATA: ls_dd40v TYPE dd40v,
+      ls_tadir TYPE tadir,
+      ls_e071  TYPE e071,
+      lv_task  TYPE trkorr.
+
+" --- DDIC put ---
+ls_dd40v-typename   = '${safeName}'.
+ls_dd40v-ddtext     = '${safeDesc}'.
+ls_dd40v-rowkind    = 'S'.
+ls_dd40v-rowtype    = '${safeRowType}'.
+ls_dd40v-accessmode = 'T'.
+ls_dd40v-keykind    = 'N'.
+CALL FUNCTION 'DDIF_TTYP_PUT'
+  EXPORTING name = '${safeName}' dd40v_wa = ls_dd40v
+  EXCEPTIONS OTHERS = 1.
+IF sy-subrc <> 0.
+  out->write( |DDIF_TTYP_PUT sy-subrc={ sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 } { sy-msgv2 }| ).
+  RETURN.
+ENDIF.
+
+" --- TADIR (skip if already present, e.g. retry after partial) ---
+SELECT SINGLE pgmid FROM tadir INTO @DATA(lv_pgmid)
+  WHERE pgmid = 'R3TR' AND object = 'TTYP' AND obj_name = '${safeName}'.
+IF sy-subrc <> 0.
+  ls_tadir-pgmid      = 'R3TR'.
+  ls_tadir-object     = 'TTYP'.
+  ls_tadir-obj_name   = '${safeName}'.
+  ls_tadir-devclass   = '${safePkg}'.
+  ls_tadir-srcsystem  = sy-sysid.
+  ls_tadir-author     = sy-uname.
+  ls_tadir-masterlang = sy-langu.
+  INSERT INTO tadir VALUES ls_tadir.
+  IF sy-subrc <> 0.
+    out->write( |TADIR insert failed sy-subrc={ sy-subrc }| ). RETURN.
+  ENDIF.
+ENDIF.
+
+" --- Transport assignment (if non-local + transport given) ---
+IF '${safePkg}' <> '$TMP' AND '${safeTransport}' IS NOT INITIAL.
+  " Find the user's open task in this request
+  SELECT SINGLE trkorr FROM e070 INTO @lv_task
+    WHERE strkorr = '${safeTransport}'
+      AND trstatus = 'D'
+      AND as4user = @sy-uname.
+  IF sy-subrc <> 0.
+    " Fall back to the request itself
+    lv_task = '${safeTransport}'.
+  ENDIF.
+
+  " Skip if already in the transport
+  SELECT SINGLE trkorr FROM e071 INTO @DATA(lv_existing_task)
+    WHERE trkorr = @lv_task AND pgmid = 'R3TR' AND object = 'TTYP' AND obj_name = '${safeName}'.
+  IF sy-subrc <> 0.
+    ls_e071-trkorr   = lv_task.
+    ls_e071-as4pos   = 1.
+    ls_e071-pgmid    = 'R3TR'.
+    ls_e071-object   = 'TTYP'.
+    ls_e071-obj_name = '${safeName}'.
+    ls_e071-objfunc  = 'K'.
+    INSERT INTO e071 VALUES ls_e071.
+    IF sy-subrc <> 0.
+      out->write( |E071 insert failed sy-subrc={ sy-subrc } — TADIR is set but object is not on transport| ).
+    ENDIF.
+  ENDIF.
+ENDIF.
+
+COMMIT WORK.
+out->write( 'OK' ).
+`;
+
+      try {
+        const output = await this.runClassrun(methodBody, 'ZCL_TMP_TTYP_CREATE');
+        if (!output.includes('OK')) {
+          this.fail(`abap_create(${nameUpper}): ${output.trim() || 'TTYP creation returned non-zero sy-subrc'}`);
+        }
+        return this.success({
+          message:
+            `Table type ${nameUpper} created in inactive state (line type ${rowType}). ` +
+            `Activate with abap_activate.`,
+          name: nameUpper,
+          type: 'TTYP',
+          package: pkg,
+          rowType
         });
       } catch (error: any) {
         this.fail(formatError(`abap_create(${nameUpper})`, error));

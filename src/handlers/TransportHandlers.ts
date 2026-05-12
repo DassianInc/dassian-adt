@@ -453,7 +453,15 @@ export class TransportHandlers extends BaseHandler {
         return this.success({ transport: args.transport, released: true, result });
       } catch (firstError: any) {
         const msg = (firstError?.message || '').toLowerCase();
-        if (msg.includes('task') && (msg.includes('not yet released') || msg.includes('referencing'))) {
+        // Three patterns trigger the auto-task-release path:
+        //  - "task not yet released" / "referencing" — child task still open
+        //  - "is unclassified" — child task has trfunction='X' (Dassian rule rejects this)
+        if (msg.includes('task') && (
+          msg.includes('not yet released') ||
+          msg.includes('referencing') ||
+          msg.includes('is unclassified') ||
+          msg.includes('unclassified')
+        )) {
           // Parent request can't release yet — find and release its tasks first.
           // Query E070 directly (fast) instead of userTransports (slow on large systems).
           const e070 = await this.withSession(() =>
@@ -464,6 +472,9 @@ export class TransportHandlers extends BaseHandler {
           const tasks: string[] = rows.map((r: any) => r.TRKORR || r.trkorr).filter(Boolean);
 
           for (const task of tasks) {
+            // Dassian's CTS rules reject "Unclassified" task releases. Classify each
+            // task to Correction first (no-op if already correct) before releasing.
+            try { await this.classifyTask(task); } catch (_) { /* ignore */ }
             await this.notify(`Releasing task ${task}…`);
             await this.releaseOne(task, args.ignoreAtc || false);
           }
