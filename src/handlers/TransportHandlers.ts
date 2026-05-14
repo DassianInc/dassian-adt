@@ -10,34 +10,37 @@ export class TransportHandlers extends BaseHandler {
       {
         name: 'transport_create',
         description:
-          'Create a new transport request. ' +
-          'Returns the transport request number (e.g. D23K900123). ' +
-          'Note: a child task is created automatically — objects must be assigned via transport_assign. ' +
-          'After creating, use transport_assign to add objects, then transport_release when ready. ' +
-          'Set transportType="toc" to create a Transport of Copies (TOC) instead of a Workbench request.',
+          'Create a new transport request. Returns the transport request number (e.g. D23K900123). ' +
+          'WORKBENCH (default): creates request + classified Correction task — anchor object required, pass the TASK number to abap_set_source/transport_assign. ' +
+          'TOC (transportType="toc"): creates a Transport of Copies via FM TR_INSERT_NEW_COMM — no child task, no anchor object required, ' +
+          'requires targetSystem (e.g. "C23", "VD3"). Use transport_bundle_into_toc to copy E071 rows from source transports into the ToC.',
         inputSchema: {
           type: 'object',
           properties: {
             description: { type: 'string', description: 'Short description for the transport (shown in STMS)' },
             package: {
               type: 'string',
-              description: 'Target package, e.g. /DSN/CORE. If omitted, SAP derives it from the anchor object.'
+              description: 'Target package, e.g. /DSN/CORE. If omitted, SAP derives it from the anchor object (workbench only).'
             },
             objectName: {
               type: 'string',
-              description: 'Name of one object to anchor the transport to (required by ADT API)'
+              description: 'Name of one object to anchor the transport to. Required for workbench; ignored for ToC.'
             },
             objectType: {
               type: 'string',
-              description: 'Type of the anchor object (e.g. CLAS, DDLS/DF)'
+              description: 'Type of the anchor object (e.g. CLAS, DDLS/DF). Required for workbench; ignored for ToC.'
             },
             transportType: {
               type: 'string',
               enum: ['workbench', 'toc'],
               description: 'Transport type: "workbench" (default, TRFUNCTION=K) or "toc" (Transport of Copies, TRFUNCTION=T)'
+            },
+            targetSystem: {
+              type: 'string',
+              description: 'Target system for the transport (e.g. "C23", "VD3"). REQUIRED for ToC. Ignored for workbench (system is derived from package transport layer).'
             }
           },
-          required: ['description', 'objectName', 'objectType']
+          required: ['description']
         }
       },
       {
@@ -199,66 +202,154 @@ export class TransportHandlers extends BaseHandler {
           },
           required: ['query']
         }
+      },
+      {
+        name: 'transport_bundle_into_toc',
+        description:
+          'Copy the object contents (E071/E071K rows) of one or more source transports into an existing ' +
+          'Transport of Copies (ToC). The source transports are NOT modified — the ToC ends up with ' +
+          'duplicate E071 rows referencing the same objects, which is the deliverable snapshot pattern ' +
+          'used for point fixes. The ToC must already exist (create it with transport_create transportType="toc") ' +
+          'and must be in modifiable state (TRSTATUS=D). Drives standard FM TR_COPY_COMM in a loop.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            toc: { type: 'string', description: 'Target Transport of Copies number, e.g. C23K900150' },
+            sources: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'List of source transport request numbers to copy into the ToC, e.g. ["D23K900671","D23K901481","D23K901483"]'
+            }
+          },
+          required: ['toc', 'sources']
+        }
       }
     ];
   }
 
   async handle(toolName: string, args: any): Promise<any> {
     switch (toolName) {
-      case 'transport_create':    return this.handleCreate(args);
-      case 'transport_assign':    return this.handleAssign(args);
-      case 'transport_release':   return this.handleRelease(args);
-      case 'transport_list':      return this.handleList(args);
-      case 'transport_info':      return this.handleInfo(args);
-      case 'transport_contents':  return this.handleContents(args);
-      case 'transport_delete':    return this.handleDelete(args);
-      case 'transport_set_owner': return this.handleSetOwner(args);
-      case 'transport_add_user':  return this.handleAddUser(args);
-      case 'transport_log':       return this.handleLog(args);
-      case 'transport_find':      return this.handleFind(args);
+      case 'transport_create':            return this.handleCreate(args);
+      case 'transport_assign':            return this.handleAssign(args);
+      case 'transport_release':           return this.handleRelease(args);
+      case 'transport_list':              return this.handleList(args);
+      case 'transport_info':              return this.handleInfo(args);
+      case 'transport_contents':          return this.handleContents(args);
+      case 'transport_delete':            return this.handleDelete(args);
+      case 'transport_set_owner':         return this.handleSetOwner(args);
+      case 'transport_add_user':          return this.handleAddUser(args);
+      case 'transport_log':               return this.handleLog(args);
+      case 'transport_find':              return this.handleFind(args);
+      case 'transport_bundle_into_toc':   return this.handleBundleIntoToc(args);
       default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
   }
 
   private async handleCreate(args: any): Promise<any> {
-    const sourceUrl = buildSourceUrl(args.objectName, args.objectType);
-    // package is optional — when omitted SAP derives it from the anchor object's REF URL.
-    // Passing a wrong package causes "Error during deserialization" from SAP.
-    const devclass = args.package || '';
     // SAP transport descriptions are capped at 60 characters — longer strings cause "deserialization" errors.
     const description: string = args.description.length > 60
       ? args.description.slice(0, 60)
       : args.description;
-    // ADTClient.createTransport posts to /sap/bc/adt/cts/transports with
-    // dataname=com.sap.adt.CreateCorrectionRequest — that content type always creates
-    // a Workbench (K) regardless of any OPERATION parameter.
-    // For a Transport of Copies (TOC), we create a Workbench request first, then
-    // immediately reclassify the request header to TRFUNCTION='T' via PUT/classify.
     const isToc = args.transportType === 'toc';
+
+    // ─── ToC path ────────────────────────────────────────────────────────────
+    // Use FM TR_INSERT_NEW_COMM directly — it creates a clean ToC with no auto-task
+    // and lets us set the target system explicitly. The old approach (create Workbench
+    // then PUT-reclassify to T) left an orphan Unclassified child task and silently
+    // succeeded when the reclassify didn't actually persist.
+    if (isToc) {
+      const targetSystem = String(args.targetSystem || '').toUpperCase().trim();
+      if (!targetSystem) {
+        this.fail(
+          `transport_create(toc): targetSystem is required for a Transport of Copies (e.g. "C23", "VD3"). ` +
+          `This determines where the ToC will be delivered — Dassian point fixes typically go to a customer system.`
+        );
+      }
+
+      const safeDesc = description.replace(/'/g, "''");
+      const safeTarget = targetSystem.replace(/'/g, "''");
+
+      const methodBody = `
+DATA: lv_trkorr TYPE e070-trkorr,
+      ls_e070   TYPE e070.
+
+CALL FUNCTION 'TR_INSERT_NEW_COMM'
+  EXPORTING
+    wi_kurztext   = '${safeDesc}'
+    wi_trfunction = 'T'
+    iv_tarsystem  = '${safeTarget}'
+    wi_client     = sy-mandt
+  IMPORTING
+    we_trkorr     = lv_trkorr
+    we_e070       = ls_e070
+  EXCEPTIONS
+    invalid_targetsystem = 1
+    no_authorization     = 2
+    unallowed_user       = 3
+    unallowed_trfunction = 4
+    OTHERS               = 5.
+
+IF sy-subrc <> 0.
+  out->write( |TR_INSERT_NEW_COMM sy-subrc={ sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 } { sy-msgv2 } { sy-msgv3 }| ).
+  RETURN.
+ENDIF.
+
+IF ls_e070-trfunction <> 'T' OR ls_e070-tarsystem <> '${safeTarget}'.
+  out->write( |Created but verification failed: trfunction={ ls_e070-trfunction } target={ ls_e070-tarsystem }| ).
+  RETURN.
+ENDIF.
+
+" Defensive: make sure no auto-task got created (it shouldn't, but check anyway)
+DATA lt_tasks TYPE STANDARD TABLE OF e070.
+SELECT * FROM e070 INTO TABLE lt_tasks WHERE strkorr = lv_trkorr.
+IF lines( lt_tasks ) > 0.
+  LOOP AT lt_tasks INTO DATA(lt).
+    DELETE FROM e070 WHERE trkorr = lt-trkorr.
+    DELETE FROM e07t WHERE trkorr = lt-trkorr.
+  ENDLOOP.
+ENDIF.
+
+COMMIT WORK.
+out->write( |OK { lv_trkorr } target={ ls_e070-tarsystem }| ).
+`;
+
+      try {
+        const output = await this.runClassrun(methodBody, 'ZCL_TMP_TOC_CREATE');
+        const match = output.match(/OK\s+([A-Z0-9]+)\s+target=([A-Z0-9]+)/);
+        if (!match) {
+          this.fail(`transport_create(toc): ${output.trim() || 'TR_INSERT_NEW_COMM returned non-zero sy-subrc'}`);
+        }
+        const transportNumber = match![1];
+        return this.success({
+          transport: transportNumber,
+          transportType: 'toc',
+          targetSystem,
+          message:
+            `Transport of Copies ${transportNumber} created (target ${targetSystem}). ` +
+            `ToCs have no child task — pass ${transportNumber} to transport_assign or transport_bundle_into_toc.`
+        });
+      } catch (error: any) {
+        this.fail(formatError('transport_create(toc)', error));
+      }
+    }
+
+    // ─── Workbench path ─────────────────────────────────────────────────────
+    if (!args.objectName || !args.objectType) {
+      this.fail(
+        `transport_create(workbench): objectName and objectType are required to anchor the request. ` +
+        `For ToC use transportType="toc" with targetSystem instead.`
+      );
+    }
+    const sourceUrl = buildSourceUrl(args.objectName, args.objectType);
+    // package is optional — when omitted SAP derives it from the anchor object's REF URL.
+    // Passing a wrong package causes "Error during deserialization" from SAP.
+    const devclass = args.package || '';
+
     try {
       const result = await this.withSession(() =>
         this.adtclient.createTransport(sourceUrl, description, devclass)
       );
       const transportNumber = (result as any)?.transportNumber || result;
-
-      if (isToc) {
-        // Reclassify the REQUEST header from K (Workbench) to T (Transport of Copies).
-        // TOCs don't have child tasks — objects are assigned directly on the request.
-        const h = (this.adtclient as any).h;
-        await this.withSession(() =>
-          h.request(`/sap/bc/adt/cts/transportrequests/${transportNumber}`, {
-            method: 'PUT',
-            headers: { Accept: 'application/*' },
-            body: `<?xml version="1.0" encoding="ASCII"?><tm:root xmlns:tm="http://www.sap.com/cts/adt/tm" tm:number="${transportNumber}" tm:useraction="classify" tm:trfunction="T"/>`
-          })
-        );
-        return this.success({
-          transport: transportNumber,
-          message:
-            `TOC ${transportNumber} created. ` +
-            `Objects go directly on the request — pass ${transportNumber} (not a task) to transport_assign.`
-        });
-      }
 
       // Resolve the task number — abap_set_source needs the TASK (child), not the REQUEST (parent).
       const taskNumber = await this.resolveTaskNumber(transportNumber as string);
@@ -539,16 +630,48 @@ export class TransportHandlers extends BaseHandler {
 
   // ADT returns abortrelapifail (not a thrown error) when tasks are unreleased or other
   // soft failures occur. Throw so callers can catch and handle (e.g. auto-release tasks).
+  // Known status values:
+  //   "released" / "ok"      — success
+  //   "abortrelapifail"      — failed, do not retry
+  //   "relwithignlock"       — SAP wants confirmation to ignore locks; treat as failure so
+  //                            the caller surfaces the underlying error (often an E071 schema
+  //                            problem like wrong objfunc).
+  //   "lock*" / *fail* / *abort* — failure
+  // We also flag failure when the response contains any error-type check messages.
   private assertReleaseSucceeded(result: any): void {
     const items: any[] = Array.isArray(result) ? result : [result];
     const item = items[0] || {};
-    const status: string = item['chkrun:status'] || '';
-    if (status.includes('fail') || status.includes('abort')) {
-      const msgs: string = (item.messages || [])
+    const status: string = (item['chkrun:status'] || '').toLowerCase();
+
+    // Walk all check reports for error messages even when status is benign.
+    const reports: any[] = (item['tm:releasereports'] && Array.isArray(item['tm:releasereports']['chkrun:checkReport']))
+      ? item['tm:releasereports']['chkrun:checkReport']
+      : (item['tm:releasereports']?.['chkrun:checkReport'] ? [item['tm:releasereports']['chkrun:checkReport']] : []);
+    const errorMsgs: string[] = [];
+    for (const rep of reports) {
+      const ml = rep?.['chkrun:checkMessageList']?.['chkrun:checkMessage'];
+      const msgs = Array.isArray(ml) ? ml : (ml ? [ml] : []);
+      for (const m of msgs) {
+        if ((m?.['chkrun:type'] || '').toUpperCase() === 'E' && m?.['chkrun:shortText']) {
+          errorMsgs.push(String(m['chkrun:shortText']));
+        }
+      }
+    }
+
+    const isFailure =
+      status.includes('fail') ||
+      status.includes('abort') ||
+      status.includes('lock') ||      // relwithignlock — needs confirmation we can't give
+      status.includes('relwithign') ||
+      errorMsgs.length > 0;
+
+    if (isFailure) {
+      const legacyMsgs: string = (item.messages || [])
         .map((m: any) => m['chkrun:shortText'])
         .filter(Boolean)
         .join('; ');
-      throw new Error(msgs || item['chkrun:statusText'] || `Release failed: ${status}`);
+      const combined = [errorMsgs.join('; '), legacyMsgs].filter(Boolean).join('; ');
+      throw new Error(combined || item['chkrun:statusText'] || `Release failed: ${status}`);
     }
   }
 
@@ -795,6 +918,117 @@ ENDIF.
       return this.success({ name: args.name, transportInfo: info });
     } catch (error: any) {
       this.fail(formatError(`transport_info(${args.name})`, error));
+    }
+  }
+
+  private async handleBundleIntoToc(args: any): Promise<any> {
+    const toc = String(args.toc || '').toUpperCase().trim();
+    const sources: string[] = Array.isArray(args.sources)
+      ? args.sources.map((s: any) => String(s || '').toUpperCase().trim()).filter(Boolean)
+      : [];
+
+    if (!/^[A-Z0-9]{10,20}$/.test(toc)) {
+      this.fail(`transport_bundle_into_toc: invalid toc "${args.toc}" — expected transport number.`);
+    }
+    if (sources.length === 0) {
+      this.fail(`transport_bundle_into_toc: pass at least one source transport in "sources".`);
+    }
+    for (const s of sources) {
+      if (!/^[A-Z0-9]{10,20}$/.test(s)) {
+        this.fail(`transport_bundle_into_toc: invalid source transport "${s}".`);
+      }
+    }
+
+    const safeToc = toc.replace(/'/g, "''");
+    const sourceLiterals = sources.map(s => `'${s.replace(/'/g, "''")}'`).join(', ');
+
+    // Validate that the target is a modifiable ToC, then call TR_COPY_COMM per source.
+    const methodBody = `
+DATA: ls_e070 TYPE e070.
+SELECT SINGLE * FROM e070 INTO ls_e070 WHERE trkorr = '${safeToc}'.
+IF sy-subrc <> 0.
+  out->write( |Target ToC ${safeToc} not found in E070| ).
+  RETURN.
+ENDIF.
+IF ls_e070-trfunction <> 'T'.
+  out->write( |Target ${safeToc} is not a Transport of Copies (trfunction='{ ls_e070-trfunction }' — expected 'T')| ).
+  RETURN.
+ENDIF.
+IF ls_e070-trstatus <> 'D'.
+  out->write( |Target ToC ${safeToc} is not modifiable (trstatus='{ ls_e070-trstatus }' — expected 'D')| ).
+  RETURN.
+ENDIF.
+
+DATA lt_sources TYPE STANDARD TABLE OF trkorr.
+lt_sources = VALUE #( ${sources.map(s => `( '${s.replace(/'/g, "''")}' )`).join(' ')} ).
+
+DATA lt_copied TYPE STANDARD TABLE OF string.
+
+LOOP AT lt_sources INTO DATA(lv_src).
+  " Verify source exists
+  DATA ls_src_e070 TYPE e070.
+  SELECT SINGLE * FROM e070 INTO ls_src_e070 WHERE trkorr = lv_src.
+  IF sy-subrc <> 0.
+    out->write( |Source { lv_src } not found, skipping| ).
+    CONTINUE.
+  ENDIF.
+
+  CALL FUNCTION 'TR_COPY_COMM'
+    EXPORTING
+      wi_trkorr_from           = lv_src
+      wi_trkorr_to             = '${safeToc}'
+      wi_without_documentation = 'X'
+      wi_dialog                = ' '
+    EXCEPTIONS
+      db_access_error          = 1
+      no_authorization         = 2
+      trkorr_from_not_exist    = 3
+      trkorr_to_is_repair      = 4
+      trkorr_to_locked         = 5
+      trkorr_to_not_exist      = 6
+      trkorr_to_released       = 7
+      user_not_owner           = 8
+      wrong_client             = 9
+      wrong_category           = 10
+      object_not_patchable     = 11
+      OTHERS                   = 12.
+
+  IF sy-subrc <> 0.
+    out->write( |TR_COPY_COMM { lv_src } -> { '${safeToc}' } sy-subrc={ sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 } { sy-msgv2 }| ).
+    " Don't abort — keep going for the remaining sources, but flag overall failure
+    APPEND |FAIL { lv_src } subrc={ sy-subrc }| TO lt_copied.
+  ELSE.
+    APPEND |OK { lv_src }| TO lt_copied.
+  ENDIF.
+ENDLOOP.
+
+COMMIT WORK.
+
+" Final E071 count on the ToC
+SELECT COUNT(*) FROM e071 INTO @DATA(lv_count) WHERE trkorr = '${safeToc}'.
+out->write( |--- Result ---| ).
+LOOP AT lt_copied INTO DATA(lv_r).
+  out->write( lv_r ).
+ENDLOOP.
+out->write( |Total E071 entries on ${safeToc}: { lv_count }| ).
+out->write( 'DONE' ).
+`;
+
+    try {
+      const output = await this.runClassrun(methodBody, 'ZCL_TMP_TOC_BUNDLE');
+      if (!output.includes('DONE')) {
+        this.fail(`transport_bundle_into_toc(${toc}): ${output.trim()}`);
+      }
+      if (output.includes('FAIL ')) {
+        this.fail(`transport_bundle_into_toc(${toc}): one or more sources failed:\n${output}`);
+      }
+      return this.success({
+        toc,
+        sourcesCopied: sources,
+        details: output.trim()
+      });
+    } catch (error: any) {
+      this.fail(formatError(`transport_bundle_into_toc(${toc})`, error));
     }
   }
 }
