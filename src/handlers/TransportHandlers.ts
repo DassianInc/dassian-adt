@@ -66,13 +66,18 @@ export class TransportHandlers extends BaseHandler {
         annotations: { destructiveHint: true },
         description:
           'Release a transport request. Automatically releases child tasks first, then the parent request. ' +
+          'Performs a pre-release check for inactive objects — if any objects in the transport are inactive, ' +
+          'release would hang at the SAP backend (the agent sees "operation timed out" with no useful detail). ' +
+          'When inactive objects are detected, fail-fast with the list. Pass autoActivate=true to activate them ' +
+          'automatically before releasing. ' +
           'WARNING: Irreversible. Only call when explicitly asked to release. ' +
           'NEVER call automatically after activation — always wait for explicit instruction.',
         inputSchema: {
           type: 'object',
           properties: {
-            transport: { type: 'string', description: 'Transport request number (e.g. D23K900123)' },
-            ignoreAtc: { type: 'boolean', description: 'Skip ATC checks on release (default false)' }
+            transport:    { type: 'string',  description: 'Transport request number (e.g. D23K900123)' },
+            ignoreAtc:    { type: 'boolean', description: 'Skip ATC checks on release (default false)' },
+            autoActivate: { type: 'boolean', description: 'If inactive objects are detected in the transport, activate them automatically before releasing (default false — fail-fast instead).' }
           },
           required: ['transport']
         }
@@ -341,9 +346,14 @@ out->write( |OK { lv_trkorr } target={ ls_e070-tarsystem }| ).
       );
     }
     const sourceUrl = buildSourceUrl(args.objectName, args.objectType);
-    // package is optional — when omitted SAP derives it from the anchor object's REF URL.
-    // Passing a wrong package causes "Error during deserialization" from SAP.
-    const devclass = args.package || '';
+    // SAP can't always derive the package from the anchor object URL — many object types
+    // (CLAS, BDEF, PROG/I, namespaced classes) fail with "specify a package". When the
+    // caller didn't pass one, do the objectStructure lookup automatically before creating
+    // the transport — saves an agent round-trip and prevents the most-common failure mode.
+    let devclass = args.package || '';
+    if (!devclass) {
+      devclass = (await this.lookupPackageForObject(args.objectName, args.objectType)) || '';
+    }
 
     try {
       const result = await this.withSession(() =>
@@ -389,6 +399,77 @@ out->write( |OK { lv_trkorr } target={ ls_e070-tarsystem }| ).
         );
       }
       this.fail(formatError('transport_create', error));
+    }
+  }
+
+  /**
+   * Return the list of inactive objects whose transport assignment matches `transportNumber`
+   * or any of its child tasks. SAP's release pipeline activates objects before exporting them —
+   * if any are inactive (or have unresolvable activation errors), the release hangs and the
+   * HTTP client times out with no actionable detail. Detecting this up-front lets us fail fast.
+   */
+  private async findInactiveObjectsForTransport(
+    transportNumber: string
+  ): Promise<Array<{ name: string; type: string; uri: string }>> {
+    try {
+      // Collect the parent + all child tasks so we catch objects on either.
+      const taskRows = await this.withSession(() =>
+        this.adtclient.tableContents('E070', 100, false,
+          `SELECT trkorr FROM e070 WHERE strkorr = '${transportNumber}' AND trstatus = 'D'`)
+      ) as any;
+      const tasks: string[] = (taskRows?.values || taskRows?.records || taskRows?.value || [])
+        .map((r: any) => (r.TRKORR || r.trkorr || '').toUpperCase())
+        .filter(Boolean);
+      const scope = new Set<string>([transportNumber, ...tasks]);
+
+      const records: any[] = await this.withSession(() =>
+        this.adtclient.inactiveObjects()
+      ) as any[];
+
+      const blocking: Array<{ name: string; type: string; uri: string }> = [];
+      for (const rec of records || []) {
+        const obj = rec?.object;
+        const trans = rec?.transport;
+        if (!obj || !trans) continue;
+        const transName: string = String(trans['adtcore:name'] || '').toUpperCase();
+        if (!scope.has(transName)) continue;
+        const name = String(obj['adtcore:name'] || '');
+        const type = String(obj['adtcore:type'] || '');
+        const uri  = String(obj['adtcore:uri']  || '');
+        if (name && uri) blocking.push({ name, type, uri });
+      }
+      return blocking;
+    } catch (_) {
+      // If the check itself fails, don't block the release path — let SAP surface
+      // whatever error it would have surfaced. The check is a usability nicety, not a gate.
+      return [];
+    }
+  }
+
+  /**
+   * Look up the package an existing object belongs to.
+   * Returns '' on any failure — callers should fall back to letting SAP report
+   * "specify a package" so the user can supply one manually.
+   *
+   * objectStructure() doesn't include packageRef for many types (CLAS, BDEF, etc.),
+   * but transportInfo() always returns DEVCLASS as part of its header.
+   */
+  private async lookupPackageForObject(name: string, type: string): Promise<string> {
+    if (!name || !type) return '';
+    try {
+      const sourceUrl = buildSourceUrl(name, type);
+      const info: any = await this.withSession(() =>
+        this.adtclient.transportInfo(sourceUrl)
+      );
+      const pkg: string =
+        info?.DEVCLASS ||
+        info?.devclass ||
+        info?.packageRef?.name ||
+        info?.packageRef?.['adtcore:name'] ||
+        '';
+      return String(pkg || '').trim();
+    } catch (_) {
+      return '';
     }
   }
 
@@ -535,6 +616,47 @@ out->write( |OK { lv_trkorr } target={ ls_e070-tarsystem }| ).
     );
     if (!confirmed) {
       this.fail(`transport_release(${args.transport}): cancelled by user.`);
+    }
+
+    // Pre-release check: inactive objects in the transport cause SAP's release pipeline to hang
+    // at the activation step. The HTTP timeout that surfaces is uninformative.
+    // Find inactive objects scoped to this transport BEFORE attempting release.
+    const transportUpper = args.transport.toUpperCase();
+    const blockingInactive = await this.findInactiveObjectsForTransport(transportUpper);
+    if (blockingInactive.length > 0) {
+      if (args.autoActivate) {
+        await this.notify(
+          `${blockingInactive.length} inactive object(s) detected — activating before release…`,
+          'warning'
+        );
+        for (const obj of blockingInactive) {
+          try {
+            await this.withSession(() =>
+              this.adtclient.activate(obj.name, obj.uri)
+            );
+          } catch (e: any) {
+            this.fail(
+              `transport_release(${args.transport}): auto-activation of ${obj.type} ${obj.name} failed: ${e?.message || e}. ` +
+              `Activate it manually via abap_activate, then retry release.`
+            );
+          }
+        }
+        // Re-check after activation — anything still inactive blocks the release.
+        const stillInactive = await this.findInactiveObjectsForTransport(transportUpper);
+        if (stillInactive.length > 0) {
+          const list = stillInactive.map(o => `  - ${o.type} ${o.name}`).join('\n');
+          this.fail(
+            `transport_release(${args.transport}): ${stillInactive.length} object(s) still inactive after auto-activate:\n${list}\n` +
+            `Activate them manually via abap_activate (and fix any syntax errors), then retry.`
+          );
+        }
+      } else {
+        const list = blockingInactive.map(o => `  - ${o.type} ${o.name}`).join('\n');
+        this.fail(
+          `transport_release(${args.transport}): ${blockingInactive.length} inactive object(s) would block release:\n${list}\n` +
+          `Run abap_activate on these objects first, or call transport_release again with autoActivate=true.`
+        );
+      }
     }
 
     try {

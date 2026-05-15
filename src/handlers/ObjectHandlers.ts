@@ -448,7 +448,9 @@ IF '${safePkg}' <> '$TMP' AND '${safeTransport}' IS NOT INITIAL.
     ls_e071-pgmid    = 'R3TR'.
     ls_e071-object   = 'TTYP'.
     ls_e071-obj_name = '${safeName}'.
-    ls_e071-objfunc  = 'K'.
+    " objfunc must be BLANK for R3TR TTYP entries — 'K' triggers TR/589
+    " "Combination of object type and function invalid" at release time.
+    ls_e071-objfunc  = ''.
     INSERT INTO e071 VALUES ls_e071.
     IF sy-subrc <> 0.
       out->write( |E071 insert failed sy-subrc={ sy-subrc } — TADIR is set but object is not on transport| ).
