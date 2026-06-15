@@ -257,3 +257,65 @@ describe('formatActivationMessages', () => {
     expect(result).toContain('[E]');
   });
 });
+
+describe('TK164 transport-request locks (retryable)', () => {
+  const tk164 = 'Internal error: Request X22K904156 is locked; action canceled [corrNr=*; T100KEY-ID=TK; T100KEY-NO=164; T100KEY-V1=X22K904156]';
+
+  it('classifies "Request X is locked; action canceled" as locked', () => {
+    expect(parseAdtError({ message: tk164 }).isLocked).toBe(true);
+  });
+
+  it('classifies via the TK/164 message-key bag', () => {
+    const info = parseAdtError({ message: 'something [T100KEY-ID=TK; T100KEY-NO=164]' });
+    expect(info.isLocked).toBe(true);
+  });
+
+  it('does not misclassify TK164 as a session timeout', () => {
+    expect(parseAdtError({ message: tk164 }).isSessionTimeout).toBe(false);
+  });
+
+  it('still classifies classic object locks', () => {
+    expect(parseAdtError({ message: 'Object is already locked by user PMCFARLING' }).isLocked).toBe(true);
+  });
+
+  it('still excludes object-state failures dressed up with "locked"', () => {
+    // inconsistent/syntax/inactive must NOT be treated as retryable user locks
+    expect(parseAdtError({ message: 'object is inconsistent and cannot be locked' }).isLocked).toBe(false);
+  });
+});
+
+describe('HTTP status extracted from message string', () => {
+  it('treats bare "Request failed with status code 400" as ambiguous-400 session drop', () => {
+    // Library re-wraps the axios error and loses .response.status / .err
+    const info = parseAdtError({ message: 'Error: Request failed with status code 400' });
+    expect(info.httpStatus).toBe(400);
+    expect(info.isAmbiguous400).toBe(true);
+    expect(info.isSessionTimeout).toBe(true);
+  });
+
+  it('extracts 404 from message and classifies not found', () => {
+    const info = parseAdtError({ message: 'Error: Request failed with status code 404' });
+    expect(info.httpStatus).toBe(404);
+    expect(info.isNotFound).toBe(true);
+  });
+
+  it('prefers an explicit numeric status over the message', () => {
+    const info = parseAdtError({ err: 405, message: 'Request failed with status code 400' });
+    expect(info.httpStatus).toBe(405);
+    expect(info.isLockNotSupported).toBe(true);
+  });
+
+  it('does not treat a 400 with a real body as ambiguous', () => {
+    // A genuine bad-request body (e.g. a SQL error) carries no "status code NNN" axios phrasing
+    // and no extractable numeric status, so it must not be classified as a session drop.
+    const info = parseAdtError({ message: 'Unknown column name "FOO".' });
+    expect(info.isAmbiguous400).toBe(false);
+    expect(info.isSessionTimeout).toBe(false);
+  });
+
+  it('formatError on ambiguous-400 no longer pushes login() looping', () => {
+    const msg = formatError('abap_get_source(X)', { message: 'Error: Request failed with status code 400' });
+    expect(msg).not.toMatch(/Call login\(\)/);
+    expect(msg.toLowerCase()).toContain('do not loop');
+  });
+});

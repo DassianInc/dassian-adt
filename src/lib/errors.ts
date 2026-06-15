@@ -68,9 +68,19 @@ export function parseAdtError(error: any): AdtErrorInfo {
   // AdtErrorException (from the abap-adt-api library) stores the HTTP status code in .err,
   // NOT in .response.status — .response is often undefined on these exceptions.
   // We also check .response?.status for any other error shapes that do set it.
-  const status: number | undefined =
+  //
+  // Fallback: some error shapes lose the numeric status entirely (the library re-wraps the
+  // axios error as a plain Error whose message is "Error: Request failed with status code 400").
+  // Parse the status out of the message text so classification (esp. isAmbiguous400) still works.
+  // Without this, hundreds of bare-400 session drops surface as raw "status code 400" with no
+  // re-login attempt — observed ~634× in the production error log.
+  let status: number | undefined =
     error?.response?.status ??
     (typeof error?.err === 'number' ? error.err : undefined);
+  if (status === undefined) {
+    const statusMatch = rawMessage.match(/status code (\d{3})/i);
+    if (statusMatch) status = Number(statusMatch[1]);
+  }
 
   // A 400 on basic read operations (get_source, abap_table, abap_search) often means
   // the session cookie has expired — SAP returns 400 instead of 401 in this case.
@@ -103,19 +113,28 @@ export function parseAdtError(error: any): AdtErrorInfo {
       msg.includes('in adjustment') ||
       msg.includes('upgradeflag'),
     isLocked:
-      // Only true when another user/session holds the lock — not when a lock
-      // fails due to object state (inconsistent, syntax errors, etc.)
-      (msg.includes('already locked') ||
-       msg.includes('locked by user') ||
-       msg.includes('locked by another') ||
-       // 'enqueue' alone is too broad — SAP uses it in activation-error messages too.
-       // Only treat as a lock when enqueue failure implies another holder.
-       (msg.includes('enqueue') && (msg.includes('user') || msg.includes('another') || msg.includes('hold')))
-      ) &&
-      !msg.includes('inconsistent') &&
-      !msg.includes('syntax error') &&
-      !msg.includes('not active') &&
-      !msg.includes('inactive'),
+      // Transport-request locks (TK164: "Request X22K900123 is locked; action canceled").
+      // These are transient enqueue locks on the transport request itself — held briefly by
+      // the session that created/modified it, and they self-clear within seconds. They are
+      // RETRYABLE, but the object-lock phrases below don't match ("is locked" ≠ "already locked"),
+      // so without this clause the set_source/transport retry loops bail on the first hit.
+      /request\s+[a-z0-9]+\s+is locked/.test(msg) ||
+      (msg.includes('t100key-id=tk') && msg.includes('164')) ||
+      (
+        // Object locks: only true when another user/session holds the lock — not when a lock
+        // fails due to object state (inconsistent, syntax errors, etc.)
+        (msg.includes('already locked') ||
+         msg.includes('locked by user') ||
+         msg.includes('locked by another') ||
+         // 'enqueue' alone is too broad — SAP uses it in activation-error messages too.
+         // Only treat as a lock when enqueue failure implies another holder.
+         (msg.includes('enqueue') && (msg.includes('user') || msg.includes('another') || msg.includes('hold')))
+        ) &&
+        !msg.includes('inconsistent') &&
+        !msg.includes('syntax error') &&
+        !msg.includes('not active') &&
+        !msg.includes('inactive')
+      ),
     isNotFound:
       status === 404 ||
       msg.includes('does not exist') ||
@@ -147,8 +166,10 @@ export function formatError(operation: string, error: any): string {
   // still reaches here the session state is genuinely broken. Call login() explicitly to reset.
   if (info.isAmbiguous400) {
     return (
-      `${operation} failed: HTTP 400 with no error detail — this is a stale CSRF token or expired ` +
-      `session, NOT a bad request. Call login() to establish a fresh session, then retry the operation.`
+      `${operation} failed: HTTP 400 with no error detail. withSession already re-logged in and ` +
+      `retried once, so a dropped session has been ruled out. The likely cause is the request itself: ` +
+      `a non-existent object/name, a malformed query, or a path that is wrong for this object type — ` +
+      `verify those before assuming an auth problem. Do NOT loop on reconnecting.`
     );
   }
 
