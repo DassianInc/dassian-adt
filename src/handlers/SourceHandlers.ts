@@ -328,17 +328,26 @@ export class SourceHandlers extends BaseHandler {
     // Find/replace within method body
     const occurrences = methodBody.split(old_string).length - 1;
     if (occurrences === 0) {
+      // The most common cause of this is targeting the wrong method: the string exists in the
+      // class, just in a different method. Scan every method and report where it actually lives,
+      // so the caller corrects the target instead of assuming the tool is flaky and falling back
+      // to a full-class rewrite (which is how a real incident clobbered an adjacent method).
+      const otherMethods = findMethodsContaining(source!, old_string, method);
+      const locationHint = otherMethods.length > 0
+        ? ` NOTE: that exact string IS present in METHOD ${otherMethods.join(', ')} — did you mean to edit ${otherMethods.length === 1 ? `METHOD ${otherMethods[0]}` : 'one of those'}? Re-run with the correct method.`
+        : '';
+
       // Show the method body so the model can see what's actually there
       const bodyLines = methodBody.split('\n');
       const preview = bodyLines.slice(0, 40).join('\n') + (bodyLines.length > 40 ? `\n... (${bodyLines.length - 40} more lines)` : '');
       const input = await this.elicitForm(
-        `abap_edit_method: old_string not found in METHOD ${method}. ` +
+        `abap_edit_method: old_string not found in METHOD ${method}.${locationHint} ` +
         `The search is case-sensitive. Method body (first 40 lines):\n\n${preview}\n\nProvide the corrected old_string to search for.`,
         { old_string: { type: 'string', title: 'old_string', description: 'Exact string to find in the method body (case-sensitive)' } },
         ['old_string']
       );
       if (!input?.old_string) {
-        this.fail(`abap_edit_method: old_string "${old_string}" not found within METHOD ${method}.`);
+        this.fail(`abap_edit_method: old_string "${old_string}" not found within METHOD ${method}.${locationHint}`);
       }
       args.old_string = input!.old_string;
       return this.handleEditMethod(args);
@@ -747,6 +756,36 @@ export class SourceHandlers extends BaseHandler {
       this.fail(formatError(`abap_get_function_group(${args.name})`, error));
     }
   }
+}
+
+/**
+ * Scan every METHOD...ENDMETHOD block in a class and return the names of methods (other than
+ * `excludeMethod`) whose body contains `needle`. Used by abap_edit_method to tell the caller
+ * "your string is in method X, not the one you targeted" instead of a bare "not found".
+ */
+function findMethodsContaining(source: string, needle: string, excludeMethod: string): string[] {
+  if (!needle) return [];
+  const exclude = excludeMethod.toUpperCase();
+  const startRe = /^\s*METHOD\s+(\S+)\s*\./gim;
+  const starts: Array<{ name: string; index: number }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = startRe.exec(source)) !== null) {
+    starts.push({ name: m[1].replace(/\.$/, ''), index: m.index });
+  }
+  const hits: string[] = [];
+  for (let i = 0; i < starts.length; i++) {
+    const bodyStart = starts[i].index;
+    const rest = source.slice(bodyStart);
+    const endMatch = /^\s*ENDMETHOD\s*\./im.exec(rest);
+    const bodyEnd = endMatch
+      ? bodyStart + endMatch.index + endMatch[0].length
+      : (starts[i + 1]?.index ?? source.length);
+    const body = source.slice(bodyStart, bodyEnd);
+    if (starts[i].name.toUpperCase() !== exclude && body.includes(needle)) {
+      hits.push(starts[i].name);
+    }
+  }
+  return hits;
 }
 
 /**

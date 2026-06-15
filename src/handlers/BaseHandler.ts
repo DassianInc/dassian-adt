@@ -16,6 +16,8 @@ export type NotifyFn = (level: 'info' | 'warning' | 'error', message: string) =>
 export type SamplingFn = (systemPrompt: string, userMessage: string, maxTokens?: number) => Promise<string>;
 
 export abstract class BaseHandler {
+  /** Monotonic counter used to generate unique temp-class names in runClassrun. */
+  private static runCounter = 0;
   protected readonly adtclient: ADTClient;
   protected readonly logger = createLogger(this.constructor.name);
   private _elicit?: ElicitFn;
@@ -387,7 +389,15 @@ ENDCLASS.`;
    * Does NOT paginate — callers are responsible for keeping output manageable.
    */
   protected async runClassrun(methodBody: string, className = 'ZCL_TMP_ADT_RUN'): Promise<string> {
-    const upperName = className.toUpperCase();
+    // Make the temp class name unique per invocation. Reusing a fixed name (ZCL_TMP_ADT_RUN,
+    // ZCL_TMP_TR_FIND, etc.) means a class left behind by a crashed/timed-out prior run blocks
+    // every subsequent call with "already exists and could not be cleaned up" — observed 26× in
+    // the production error log. A unique suffix sidesteps the stale-lock cleanup race entirely;
+    // these are $TMP objects (never transported) so an occasional orphan is harmless.
+    // Class names are capped at 30 chars, so truncate the base to leave room for the suffix.
+    const suffix = `_${BaseHandler.runCounter++}${Date.now().toString(36).slice(-4)}`.toUpperCase();
+    const base = className.toUpperCase().slice(0, 30 - suffix.length);
+    const upperName = `${base}${suffix}`;
     const classUrl  = `/sap/bc/adt/oo/classes/${upperName.toLowerCase()}`;
     const sourceUrl = `${classUrl}/source/main`;
     let classCreated = false;

@@ -2,7 +2,7 @@ import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
 import { buildObjectUrl, buildSourceUrl } from '../lib/urlBuilder.js';
-import { formatError } from '../lib/errors.js';
+import { formatError, parseAdtError } from '../lib/errors.js';
 
 export class TransportHandlers extends BaseHandler {
   getTools(): ToolDefinition[] {
@@ -356,10 +356,61 @@ out->write( |OK { lv_trkorr } target={ ls_e070-tarsystem }| ).
     }
 
     try {
-      const result = await this.withSession(() =>
-        this.adtclient.createTransport(sourceUrl, description, devclass)
-      );
-      const transportNumber = (result as any)?.transportNumber || result;
+      // createTransport is NOT idempotent — each call creates a new request. On some systems
+      // (S/4 2022) the call can persist the request header and then throw TK164 ("Request X is
+      // locked; action canceled") when the follow-on task-creation step races the request's own
+      // enqueue lock, leaving an orphaned, taskless request. A naive retry would spawn ANOTHER
+      // orphan every time (observed in the error log: 904156, 904157, …).
+      //
+      // Instead: on a lock error, recover the request number from the message. The request DID
+      // get created, so adopt it once the lock clears — and only if it still has no task do we
+      // delete the empty husk and do one clean re-create. parseAdtError.isLocked now matches TK164.
+      const tryCreate = async (): Promise<string> => {
+        const result = await this.withSession(() =>
+          this.adtclient.createTransport(sourceUrl, description, devclass)
+        );
+        return ((result as any)?.transportNumber || result) as string;
+      };
+      const extractRequestNumber = (err: any): string => {
+        const m = String(err?.message || '').match(/T100KEY-V1=([A-Z]\d{2}[KT]\d{6})/i)
+               || String(err?.message || '').match(/\b([A-Z]\d{2}[KT]\d{6})\b\s+is locked/i);
+        return m ? m[1].toUpperCase() : '';
+      };
+
+      let transportNumber = '';
+      let adopted = '';        // request number recovered from a TK164 lock error
+      let lastError: any = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+          const delay = [0, 3000, 8000][attempt];
+          await this.notify(`Transport request locked — retrying create in ${delay / 1000}s (attempt ${attempt + 1}/3)…`, 'warning');
+          await new Promise(r => setTimeout(r, delay));
+        }
+        try {
+          if (adopted) {
+            // A prior attempt left a dangling request. If the lock has cleared and a task now
+            // exists, adopt it; otherwise delete the empty husk and create one cleanly below.
+            const t = await this.resolveTaskNumber(adopted);
+            if (t && t !== adopted) { transportNumber = adopted; lastError = null; break; }
+            try { await this.withSession(() => this.adtclient.transportDelete(adopted)); } catch (_) {}
+            adopted = '';
+          }
+          transportNumber = await tryCreate();
+          lastError = null;
+          break;
+        } catch (e: any) {
+          lastError = e;
+          const recovered = extractRequestNumber(e);
+          if (recovered) adopted = recovered;
+          // Only retry on lock contention (TK164 etc.); surface any other error immediately.
+          if (!parseAdtError(e).isLocked) break;
+        }
+      }
+      if (!transportNumber) {
+        // Unrecoverable — don't leak the dangling request we created.
+        if (adopted) { try { await this.withSession(() => this.adtclient.transportDelete(adopted)); } catch (_) {} }
+        throw lastError || new Error('transport_create: request could not be created.');
+      }
 
       // Resolve the task number — abap_set_source needs the TASK (child), not the REQUEST (parent).
       const taskNumber = await this.resolveTaskNumber(transportNumber as string);
@@ -713,16 +764,39 @@ out->write( |OK { lv_trkorr } target={ ls_e070-tarsystem }| ).
     const h = (this.adtclient as any).h;
     const action = ignoreAtc ? 'relObjigchkatc' : 'newreleasejobs';
 
+    // A transport release commits server-side but the POST can take longer than the HTTP client
+    // timeout — the call rejects while SAP completes the release. Detect that case and confirm via
+    // the transport's status instead of surfacing a misleading "release failed". (Previously the
+    // agent had to manually re-check the open-transport list after every release timeout.)
+    const isTimeout = (e: any): boolean => {
+      const code = String(e?.code || e?.err?.code || '').toUpperCase();
+      const m = String(e?.message || '').toLowerCase();
+      return code === 'ECONNABORTED' || code === 'ETIMEDOUT' ||
+        m.includes('timeout') || m.includes('timed out') || m.includes('socket hang up') ||
+        m.includes('network') || m.includes('econnreset');
+    };
+    const recoverIfReleased = async (err: any): Promise<any> => {
+      if (isTimeout(err) && await this.wasReleased(transportNumber)) {
+        await this.notify(`Release POST timed out but ${transportNumber} is no longer modifiable — release completed server-side.`);
+        return { 'chkrun:status': 'released', recoveredFromTimeout: true, transport: transportNumber };
+      }
+      throw err;
+    };
+
     // When ignoreAtc=true the ADT library generates a blank transport number in the URL.
     // Always use the raw HTTP path — it works on all systems and avoids the library bug.
     if (ignoreAtc) {
-      return await this.withSession(() =>
-        h.request(`/sap/bc/adt/cts/transportrequests/${transportNumber}/${action}`, {
-          method: 'POST',
-          headers: { Accept: 'application/*', 'Content-Type': 'application/xml' },
-          body: `<tm:root xmlns:tm="http://www.sap.com/cts/adt/tm"/>`
-        })
-      );
+      try {
+        return await this.withSession(() =>
+          h.request(`/sap/bc/adt/cts/transportrequests/${transportNumber}/${action}`, {
+            method: 'POST',
+            headers: { Accept: 'application/*', 'Content-Type': 'application/xml' },
+            body: `<tm:root xmlns:tm="http://www.sap.com/cts/adt/tm"/>`
+          })
+        );
+      } catch (err: any) {
+        return await recoverIfReleased(err);
+      }
     }
 
     try {
@@ -736,17 +810,40 @@ out->write( |OK { lv_trkorr } target={ ls_e070-tarsystem }| ).
       const msg = (err?.message || '').toLowerCase();
       // Older SAP systems (S/4 2022) require an XML body on the POST — retry with one.
       if (msg.includes('expected the element') || msg.includes('tm}root') || msg.includes('tm:root')) {
-        const retryResult = await this.withSession(() =>
-          h.request(`/sap/bc/adt/cts/transportrequests/${transportNumber}/${action}`, {
-            method: 'POST',
-            headers: { Accept: 'application/*', 'Content-Type': 'application/xml' },
-            body: `<tm:root xmlns:tm="http://www.sap.com/cts/adt/tm"/>`
-          })
-        );
-        this.assertReleaseSucceeded(retryResult);
-        return retryResult;
+        try {
+          const retryResult = await this.withSession(() =>
+            h.request(`/sap/bc/adt/cts/transportrequests/${transportNumber}/${action}`, {
+              method: 'POST',
+              headers: { Accept: 'application/*', 'Content-Type': 'application/xml' },
+              body: `<tm:root xmlns:tm="http://www.sap.com/cts/adt/tm"/>`
+            })
+          );
+          this.assertReleaseSucceeded(retryResult);
+          return retryResult;
+        } catch (retryErr: any) {
+          return await recoverIfReleased(retryErr);
+        }
       }
-      throw err;
+      return await recoverIfReleased(err);
+    }
+  }
+
+  /**
+   * Check whether a transport request is no longer modifiable (i.e. release has started/completed).
+   * Used to confirm a release that succeeded server-side after the HTTP POST timed out.
+   * E070 TRSTATUS: 'D' = modifiable, 'L' = modifiable/protected; anything else (O/R) = released.
+   */
+  private async wasReleased(transportNumber: string): Promise<boolean> {
+    try {
+      const e070 = await this.withSession(() =>
+        this.adtclient.tableContents('E070', 1, false,
+          `SELECT trstatus FROM e070 WHERE trkorr = '${transportNumber.toUpperCase()}'`)
+      ) as any;
+      const rows: any[] = e070?.values || e070?.records || e070?.value || [];
+      const st = String(rows[0]?.TRSTATUS || rows[0]?.trstatus || '').toUpperCase();
+      return st !== '' && st !== 'D' && st !== 'L';
+    } catch (_) {
+      return false;
     }
   }
 

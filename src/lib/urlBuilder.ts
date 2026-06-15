@@ -101,7 +101,13 @@ export function buildObjectUrl(name: string, type: string): string {
   if (!name) throw new Error('Object name is required.');
   if (!type) throw new Error('Object type is required (e.g. CLAS, PROG/P, DDLS/DF).');
   const key = type.toUpperCase();
-  const basePath = TYPE_PATHS[key];
+  // Exact match first, then fall back to the base type (strip the "/SUBTYPE" suffix).
+  // SAP reports many objects with a TADIR subtype that shares its parent's ADT path —
+  // e.g. CLAS/OM, CLAS/OCN, CLAS/OE (all classes), BDEF/BO (behavior def), ENHS/XB (spot).
+  // The base path is correct for these, so resolve them instead of failing.
+  // (NESTED_TYPES like FUGR/FF/FUGR/I are intentionally NOT handled here — callers route
+  // those through resolveNestedUrl before reaching buildObjectUrl.)
+  const basePath = TYPE_PATHS[key] ?? TYPE_PATHS[key.split('/')[0]];
   if (!basePath) {
     const known = Object.keys(TYPE_PATHS).filter(k => !k.includes('/')).join(', ');
     throw new Error(

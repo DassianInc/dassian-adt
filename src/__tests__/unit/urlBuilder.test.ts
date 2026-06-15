@@ -265,3 +265,26 @@ describe('NESTED_TYPES', () => {
     expect(NESTED_TYPES.has('PROG/P')).toBe(false);
   });
 });
+
+describe('buildObjectUrl subtype fallback', () => {
+  it('falls back to base CLAS for CLAS/OM, CLAS/OCN, etc.', () => {
+    expect(buildObjectUrl('ZCL_FOO', 'CLAS/OM')).toBe('/sap/bc/adt/oo/classes/zcl_foo');
+    expect(buildObjectUrl('ZCL_FOO', 'CLAS/OCN')).toBe('/sap/bc/adt/oo/classes/zcl_foo');
+  });
+
+  it('falls back to base BDEF for BDEF/BO', () => {
+    expect(buildObjectUrl('ZBD', 'BDEF/BO')).toBe('/sap/bc/adt/bo/behaviordefinitions/zbd');
+  });
+
+  it('falls back to base ENHS for ENHS/XB', () => {
+    expect(buildObjectUrl('ZSPOT', 'ENHS/XB')).toBe('/sap/bc/adt/enhancements/spots/zspot');
+  });
+
+  it('still throws for a genuinely unsupported base type', () => {
+    expect(() => buildObjectUrl('FOO', 'WAPA')).toThrow('Unknown object type');
+  });
+
+  it('exact-match subtypes are unaffected', () => {
+    expect(buildObjectUrl('ZV', 'VIEW/DV')).toBe('/sap/bc/adt/ddic/views/zv');
+  });
+});
