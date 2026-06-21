@@ -272,4 +272,35 @@ describe('DdicHandlers dry-run behavior', () => {
     expect(tool!.inputSchema.properties.confirmPermanentCreation.description)
       .toContain('Must be exactly true');
   });
+
+  it('uses the guarded DDIF classrun path for permanent creation, not generic ADT TABL shell creation', async () => {
+    const client = {
+      createObject: jest.fn(),
+      login: jest.fn(),
+    };
+    const handler = new DdicHandlers(client as any) as any;
+    const plan = buildTransparentTablePlan({
+      ...sampleArgs,
+      dryRun: false,
+      confirmPermanentCreation: true,
+      transport: 'D25K900268',
+      transportTask: 'D25K900269',
+    });
+    handler.classifyTask = jest.fn().mockResolvedValue(undefined);
+    handler.runClassrun = jest.fn().mockResolvedValue(successfulOutputFor(plan));
+
+    const result = parseResult(await handler.validateAndHandle('ddic_create_transparent_table', {
+      ...sampleArgs,
+      dryRun: false,
+      confirmPermanentCreation: true,
+      transport: 'D25K900268',
+      transportTask: 'D25K900269',
+    }));
+
+    expect(result.status).toBe('success');
+    expect(result.dryRun).toBe(false);
+    expect(handler.classifyTask).toHaveBeenCalledWith('D25K900269');
+    expect(handler.runClassrun).toHaveBeenCalledWith(expect.stringContaining("CALL FUNCTION 'DDIF_TABL_PUT'"), 'ZCL_TMP_DDIC_TABL');
+    expect(client.createObject).not.toHaveBeenCalled();
+  });
 });

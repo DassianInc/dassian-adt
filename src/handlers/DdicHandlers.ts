@@ -2,7 +2,6 @@ import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
 import { formatError } from '../lib/errors.js';
-import { buildPackageUrl } from '../lib/urlBuilder.js';
 
 export type TransparentTableFieldType = 'CLNT' | 'CHAR' | 'SSTRING' | 'INT4';
 
@@ -380,9 +379,15 @@ DATA: ls_dd02v  TYPE dd02v,
       ls_dd02l  TYPE dd02l,
       ls_dd03l  TYPE dd03l,
       ls_dd09la TYPE dd09l,
+      ls_tadir  TYPE tadir,
+      ls_e070_req  TYPE e070,
+      ls_e070_task TYPE e070,
+      ls_e071   TYPE e071,
       lv_rc     TYPE sy-subrc,
       lv_count  TYPE i,
       lv_e071   TYPE i,
+      lv_maxpos TYPE e071-as4pos,
+      lv_pos_i  TYPE i,
       lv_failed TYPE abap_bool,
       lv_request TYPE trkorr VALUE ${abapLiteral(request)},
       lv_task    TYPE trkorr VALUE ${abapLiteral(task)}.
@@ -390,6 +395,33 @@ DATA: ls_dd02v  TYPE dd02v,
 out->write( ${abapLiteral(`START DDIC_TRANSPARENT_TABLE_CREATE ${tableName}`)} ).
 out->write( ${abapLiteral(`PACKAGE ${packageName}`)} ).
 out->write( |REQUEST { lv_request } TASK { lv_task }| ).
+
+IF lv_request IS NOT INITIAL.
+  SELECT SINGLE * FROM e070 INTO ls_e070_req
+    WHERE trkorr = lv_request.
+  IF sy-subrc <> 0 OR ls_e070_req-trfunction <> 'K' OR ls_e070_req-trstatus <> 'D'.
+    out->write( |REQUEST { lv_request } is not an open Workbench request| ).
+    out->write( 'RESULT DDIC_TRANSPARENT_TABLE_CREATE_FAILED' ).
+    RETURN.
+  ENDIF.
+
+  IF lv_task IS INITIAL.
+    out->write( 'TASK is required for permanent transport capture' ).
+    out->write( 'RESULT DDIC_TRANSPARENT_TABLE_CREATE_FAILED' ).
+    RETURN.
+  ENDIF.
+
+  SELECT SINGLE * FROM e070 INTO ls_e070_task
+    WHERE trkorr = lv_task.
+  IF sy-subrc <> 0
+      OR ls_e070_task-trfunction <> 'S'
+      OR ls_e070_task-trstatus <> 'D'
+      OR ls_e070_task-strkorr <> lv_request.
+    out->write( |TASK { lv_task } is not an open child task of { lv_request }| ).
+    out->write( 'RESULT DDIC_TRANSPARENT_TABLE_CREATE_FAILED' ).
+    RETURN.
+  ENDIF.
+ENDIF.
 
 ls_dd02v-tabname    = ${abapLiteral(tableName)}.
 ls_dd02v-ddlanguage = sy-langu.
@@ -452,6 +484,86 @@ IF sy-subrc <> 0 OR lv_rc <> 0.
 ENDIF.
 COMMIT WORK AND WAIT.
 out->write( 'DDIF_TABL_ACTIVATE OK' ).
+
+SELECT SINGLE * FROM tadir INTO ls_tadir
+  WHERE pgmid = 'R3TR'
+    AND object = 'TABL'
+    AND obj_name = ${abapLiteral(tableName)}.
+IF sy-subrc <> 0.
+  CLEAR ls_tadir.
+  ls_tadir-pgmid      = 'R3TR'.
+  ls_tadir-object     = 'TABL'.
+  ls_tadir-obj_name   = ${abapLiteral(tableName)}.
+  ls_tadir-srcsystem  = sy-sysid.
+  ls_tadir-author     = sy-uname.
+  ls_tadir-devclass   = ${abapLiteral(packageName)}.
+  ls_tadir-masterlang = sy-langu.
+  ls_tadir-created_on = sy-datum.
+  ls_tadir-check_date = sy-datum.
+  INSERT INTO tadir VALUES ls_tadir.
+  IF sy-subrc <> 0.
+    out->write( |TADIR insert failed sy-subrc={ sy-subrc }| ).
+    out->write( 'RESULT DDIC_TRANSPARENT_TABLE_CREATE_FAILED' ).
+    RETURN.
+  ENDIF.
+ELSE.
+  ls_tadir-devclass = ${abapLiteral(packageName)}.
+  ls_tadir-srcsystem = sy-sysid.
+  IF ls_tadir-author IS INITIAL.
+    ls_tadir-author = sy-uname.
+  ENDIF.
+  IF ls_tadir-masterlang IS INITIAL.
+    ls_tadir-masterlang = sy-langu.
+  ENDIF.
+  IF ls_tadir-created_on IS INITIAL.
+    ls_tadir-created_on = sy-datum.
+  ENDIF.
+  ls_tadir-check_date = sy-datum.
+  MODIFY tadir FROM ls_tadir.
+  IF sy-subrc <> 0.
+    out->write( |TADIR update failed sy-subrc={ sy-subrc }| ).
+    out->write( 'RESULT DDIC_TRANSPARENT_TABLE_CREATE_FAILED' ).
+    RETURN.
+  ENDIF.
+ENDIF.
+COMMIT WORK AND WAIT.
+out->write( ${abapLiteral(`TADIR ${packageName} recorded`)} ).
+
+IF lv_request IS NOT INITIAL OR lv_task IS NOT INITIAL.
+  SELECT COUNT(*) FROM e071 INTO lv_e071
+    WHERE ( trkorr = lv_request OR trkorr = lv_task )
+      AND pgmid = 'R3TR'
+      AND object = 'TABL'
+      AND obj_name = ${abapLiteral(tableName)}.
+  IF lv_e071 = 0.
+    CLEAR ls_e071.
+    SELECT MAX( as4pos ) FROM e071 INTO lv_maxpos
+      WHERE trkorr = lv_task.
+    lv_pos_i = lv_maxpos.
+    lv_pos_i = lv_pos_i + 1.
+    ls_e071-trkorr   = lv_task.
+    ls_e071-as4pos   = lv_pos_i.
+    ls_e071-pgmid    = 'R3TR'.
+    ls_e071-object   = 'TABL'.
+    ls_e071-obj_name = ${abapLiteral(tableName)}.
+    ls_e071-objfunc  = ''.
+    ls_e071-lockflag = 'X'.
+    INSERT INTO e071 VALUES ls_e071.
+    IF sy-subrc <> 0.
+      out->write( |E071 insert failed sy-subrc={ sy-subrc }| ).
+      out->write( 'RESULT DDIC_TRANSPARENT_TABLE_CREATE_FAILED' ).
+      RETURN.
+    ENDIF.
+    COMMIT WORK AND WAIT.
+    out->write( |E071 inserted on { lv_task } pos={ ls_e071-as4pos }| ).
+  ELSEIF lv_e071 = 1.
+    out->write( 'E071 selected request/task already contains table' ).
+  ELSE.
+    out->write( |E071 duplicate selected request/task rows count={ lv_e071 }| ).
+    out->write( 'RESULT DDIC_TRANSPARENT_TABLE_CREATE_FAILED' ).
+    RETURN.
+  ENDIF.
+ENDIF.
 
 CALL FUNCTION 'DDIF_TABL_GET'
   EXPORTING
@@ -634,7 +746,7 @@ export class DdicHandlers extends BaseHandler {
           'Safely create a client-dependent transparent DDIC table through a guarded ADT writer. ' +
           'Defaults to dryRun=true and returns the exact plan plus generated DDIF ABAP without mutating SAP. ' +
           'For non-$TMP creation, dryRun must be false, transport must be supplied, and confirmPermanentCreation must be true. ' +
-          'The writer creates the TABL shell through ADT for TADIR/E071 ownership, fills fields with DDIF_TABL_PUT, activates with DDIF_TABL_ACTIVATE, then verifies active DD02L/DD03L/DD09L, no DD08L/DD05S foreign keys, TADIR package, and request/task-bound E071.',
+          'The writer creates the DDIC table with DDIF_TABL_PUT, records TADIR/E071 ownership for the selected request/task, activates with DDIF_TABL_ACTIVATE, then verifies active DD02L/DD03L/DD09L, no DD08L/DD05S foreign keys, TADIR package, and request/task-bound E071.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -795,18 +907,6 @@ export class DdicHandlers extends BaseHandler {
       if (corrNr) {
         await this.classifyTask(corrNr);
       }
-      await this.withSession(() =>
-        this.adtclient.createObject(
-          'TABL/DT',
-          plan.name,
-          plan.package,
-          plan.description,
-          buildPackageUrl(plan.package),
-          undefined,
-          corrNr
-        )
-      );
-
       const output = await this.runClassrun(methodBody, 'ZCL_TMP_DDIC_TABL');
       try {
         validateTransparentTableOutput(plan, output);
