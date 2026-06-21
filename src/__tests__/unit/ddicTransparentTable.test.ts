@@ -28,7 +28,7 @@ function successfulOutputFor(plan = buildTransparentTablePlan({
 })): string {
   return [
     'DDIF_TABL_PUT OK',
-    'DDIF_TABL_ACTIVATE OK',
+    'DDIF_TABL_ACTIVATE OK rc=0',
     'DDIF_TABL_GET STATE=A OK fields=4',
     'READBACK DD02L OK class=TRANSP cli=X cont=A ex=1 main=',
     'READBACK DD09L OK tabart=APPL1 tabkat=0 buf=N row=C',
@@ -170,6 +170,7 @@ describe('ddic_create_transparent_table generated ABAP', () => {
 
     expect(abap).toContain("CALL FUNCTION 'DDIF_TABL_PUT'");
     expect(abap).toContain("CALL FUNCTION 'DDIF_TABL_ACTIVATE'");
+    expect(abap).toContain('lv_rc > 4');
     expect(abap).toContain("CALL FUNCTION 'DDIF_TABL_GET'");
     expect(abap).toContain("state     = 'A'");
     expect(abap).toContain("SELECT SINGLE * FROM dd02l");
@@ -216,6 +217,21 @@ describe('ddic_create_transparent_table output parser', () => {
 
     expect(validateTransparentTableOutput(plan, successfulOutputFor(plan)))
       .toContain('RESULT DDIC_TRANSPARENT_TABLE_CREATE_OK');
+  });
+
+  it('accepts activation rc=4 when the mandatory readback gates pass', () => {
+    const plan = buildTransparentTablePlan({
+      ...sampleArgs,
+      dryRun: false,
+      confirmPermanentCreation: true,
+      transport: 'D25K900268',
+      transportTask: 'D25K900269',
+    });
+
+    expect(validateTransparentTableOutput(
+      plan,
+      successfulOutputFor(plan).replace('DDIF_TABL_ACTIVATE OK rc=0', 'DDIF_TABL_ACTIVATE OK rc=4')
+    )).toContain('DDIF_TABL_ACTIVATE OK rc=4');
   });
 
   it('rejects missing evidence, mismatch lines, and duplicate result sentinels', () => {

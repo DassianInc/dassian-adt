@@ -475,7 +475,7 @@ CALL FUNCTION 'DDIF_TABL_ACTIVATE'
     not_found = 1
     put_failure = 2
     OTHERS = 3.
-IF sy-subrc <> 0 OR lv_rc <> 0.
+IF sy-subrc <> 0 OR lv_rc > 4.
   out->write( |DDIF_TABL_ACTIVATE failed sy-subrc={ sy-subrc } rc={ lv_rc }| ).
   out->write( |msg={ sy-msgid }/{ sy-msgno } { sy-msgv1 } { sy-msgv2 }| ).
   out->write( |msg2={ sy-msgv3 } { sy-msgv4 }| ).
@@ -483,7 +483,7 @@ IF sy-subrc <> 0 OR lv_rc <> 0.
   RETURN.
 ENDIF.
 COMMIT WORK AND WAIT.
-out->write( 'DDIF_TABL_ACTIVATE OK' ).
+out->write( |DDIF_TABL_ACTIVATE OK rc={ lv_rc }| ).
 
 SELECT SINGLE * FROM tadir INTO ls_tadir
   WHERE pgmid = 'R3TR'
