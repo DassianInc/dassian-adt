@@ -903,10 +903,9 @@ export class DdicHandlers extends BaseHandler {
         methodBody = buildTransparentTableClassrun(plan);
       }
 
-      const corrNr = plan.permanent ? plan.transportTask : undefined;
-      if (corrNr) {
-        await this.classifyTask(corrNr);
-      }
+      // The guarded ABAP validates that the selected transportTask is an open
+      // Correction task before inserting E071. Do not issue ADT "classify" here:
+      // D25 rejects classify on an already-correction task with SCTS_ADT_MSG 25.
       const output = await this.runClassrun(methodBody, 'ZCL_TMP_DDIC_TABL');
       try {
         validateTransparentTableOutput(plan, output);

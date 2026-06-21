@@ -299,8 +299,9 @@ describe('DdicHandlers dry-run behavior', () => {
 
     expect(result.status).toBe('success');
     expect(result.dryRun).toBe(false);
-    expect(handler.classifyTask).toHaveBeenCalledWith('D25K900269');
+    expect(handler.classifyTask).not.toHaveBeenCalled();
     expect(handler.runClassrun).toHaveBeenCalledWith(expect.stringContaining("CALL FUNCTION 'DDIF_TABL_PUT'"), 'ZCL_TMP_DDIC_TABL');
+    expect(handler.runClassrun).toHaveBeenCalledWith(expect.stringContaining("ls_e070_task-trfunction <> 'S'"), 'ZCL_TMP_DDIC_TABL');
     expect(client.createObject).not.toHaveBeenCalled();
   });
 });
