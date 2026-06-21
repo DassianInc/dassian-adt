@@ -109,11 +109,11 @@ describe('buildObjectUrl', () => {
   });
 
   it('SRVD/SRV', () => {
-    expect(buildObjectUrl('ZSRVD', 'SRVD/SRV')).toBe('/sap/bc/adt/srvd/zsrvd');
+    expect(buildObjectUrl('ZSRVD', 'SRVD/SRV')).toBe('/sap/bc/adt/ddic/srvd/sources/zsrvd');
   });
 
   it('SRVB/SVB', () => {
-    expect(buildObjectUrl('ZSRVB', 'SRVB/SVB')).toBe('/sap/bc/adt/srvb/zsrvb');
+    expect(buildObjectUrl('ZSRVB', 'SRVB/SVB')).toBe('/sap/bc/adt/businessservices/bindings/zsrvb');
   });
 
   // Enhancements

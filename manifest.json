@@ -68,7 +68,10 @@
     { "name": "transport_create", "description": "Create transport requests" },
     { "name": "transport_release", "description": "Release transports" },
     { "name": "abap_syntax_check", "description": "Check ABAP syntax" },
-    { "name": "abap_atc_run", "description": "Run ATC quality checks" }
+    { "name": "abap_atc_run", "description": "Run ATC quality checks" },
+    { "name": "ddic_create_transparent_table", "description": "Guarded dry-run-first transparent DDIC table writer with activation and readback evidence" },
+    { "name": "ddic_element", "description": "Read DDIC metadata for CDS views and data elements" },
+    { "name": "ddic_references", "description": "List DDIC objects that reference a CDS entity or data element" }
   ],
   "compatibility": {
     "platforms": ["darwin", "win32", "linux"],

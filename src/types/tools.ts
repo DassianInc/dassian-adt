@@ -9,19 +9,27 @@ export interface ToolAnnotations {
   title?: string;
 }
 
+export interface JsonSchemaProperty {
+  type: string | string[];
+  description?: string;
+  optional?: boolean;
+  enum?: string[];
+  items?: JsonSchemaProperty;
+  properties?: Record<string, JsonSchemaProperty>;
+  required?: string[];
+  default?: any;
+  additionalProperties?: boolean | JsonSchemaProperty;
+  minimum?: number;
+  maximum?: number;
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
   annotations?: ToolAnnotations;
   inputSchema: {
     type: string;
-    properties: Record<string, {
-      type: string;
-      description?: string;
-      optional?: boolean;
-      enum?: string[];
-      items?: { type: string };
-    }>;
+    properties: Record<string, JsonSchemaProperty>;
     required?: string[];
   };
 }

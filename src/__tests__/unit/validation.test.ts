@@ -6,6 +6,7 @@ import { DataHandlers } from '../../handlers/DataHandlers';
 import { QualityHandlers } from '../../handlers/QualityHandlers';
 import { GitHandlers } from '../../handlers/GitHandlers';
 import { SystemHandlers } from '../../handlers/SystemHandlers';
+import { DdicHandlers } from '../../handlers/DdicHandlers';
 import type { ToolDefinition } from '../../types/tools';
 
 /**
@@ -22,6 +23,7 @@ function getAllTools(): Array<{ handlerName: string; tool: ToolDefinition; handl
     { name: 'QualityHandlers',   cls: QualityHandlers },
     { name: 'GitHandlers',       cls: GitHandlers },
     { name: 'SystemHandlers',    cls: SystemHandlers },
+    { name: 'DdicHandlers',      cls: DdicHandlers },
   ];
 
   const result: Array<{ handlerName: string; tool: ToolDefinition; handler: any }> = [];

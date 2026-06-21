@@ -7,6 +7,7 @@ import { DataHandlers } from '../../handlers/DataHandlers';
 import { QualityHandlers } from '../../handlers/QualityHandlers';
 import { GitHandlers } from '../../handlers/GitHandlers';
 import { SystemHandlers } from '../../handlers/SystemHandlers';
+import { DdicHandlers } from '../../handlers/DdicHandlers';
 
 export interface TestHandlers {
   source: SourceHandlers;
@@ -17,6 +18,7 @@ export interface TestHandlers {
   quality: QualityHandlers;
   git: GitHandlers;
   system: SystemHandlers;
+  ddic: DdicHandlers;
 }
 
 export function hasLiveConfig(): boolean {
@@ -45,6 +47,7 @@ export function createHandlers(client: ADTClient): TestHandlers {
     quality: new QualityHandlers(client),
     git: new GitHandlers(client),
     system: new SystemHandlers(client),
+    ddic: new DdicHandlers(client),
   };
 }
 
