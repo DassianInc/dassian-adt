@@ -57,6 +57,7 @@
   },
   "tools": [
     { "name": "abap_get_source", "description": "Read ABAP source code" },
+    { "name": "abap_get_class_include", "description": "Read ABAP class include source code" },
     { "name": "abap_set_source", "description": "Write ABAP source code" },
     { "name": "abap_create", "description": "Create ABAP objects" },
     { "name": "abap_delete", "description": "Delete ABAP objects" },

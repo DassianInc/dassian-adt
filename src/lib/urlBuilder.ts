@@ -127,6 +127,15 @@ export function buildSourceUrl(name: string, type: string): string {
 }
 
 /**
+ * Build the ADT URL for a class-local include.
+ * includeType values are ADT include buckets: implementations, definitions, macros, testclasses.
+ */
+export function buildClassIncludeUrl(className: string, includeType: string): string {
+  if (!includeType) throw new Error('Class include type is required.');
+  return `${buildObjectUrl(className, 'CLAS')}/includes/${includeType.toLowerCase()}`;
+}
+
+/**
  * Build the URL for a function module (nested under its function group).
  * fgroupName: the function group (e.g. /DSN/BIL_FG)
  * fmoduleName: the function module (e.g. /DSN/BIL_CALCULATE)
