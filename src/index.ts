@@ -31,6 +31,7 @@ import { TestHandlers }      from './handlers/TestHandlers.js';
 import { RapHandlers }       from './handlers/RapHandlers.js';
 import { TraceHandlers }     from './handlers/TraceHandlers.js';
 import { DdicHandlers }      from './handlers/DdicHandlers.js';
+import { BspHandlers }       from './handlers/BspHandlers.js';
 import { resolveSystemConfigs, AuthConfig } from './lib/auth.js';
 import { logToolError, extractRawResponse } from './lib/logger.js';
 import { parseAdtError } from './lib/errors.js';
@@ -141,6 +142,7 @@ function createSystemEntry(
     new RapHandlers(client),
     new TraceHandlers(client),
     new DdicHandlers(client),
+    new BspHandlers(client),
   ];
 
   for (const h of handlers) {

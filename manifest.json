@@ -69,7 +69,8 @@
     { "name": "transport_create", "description": "Create transport requests" },
     { "name": "transport_release", "description": "Release transports" },
     { "name": "abap_syntax_check", "description": "Check ABAP syntax" },
-    { "name": "abap_atc_run", "description": "Run ATC quality checks" }
+    { "name": "abap_atc_run", "description": "Run ATC quality checks" },
+    { "name": "bsp_read_file", "description": "Read/list files in a BSP / UI5 application" }
   ],
   "compatibility": {
     "platforms": ["darwin", "win32", "linux"],

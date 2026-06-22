@@ -5,3 +5,4 @@ coverage
 *.code-workspace
 TEST_RESULTS*.md
 sap-systems.json
+*.zip
