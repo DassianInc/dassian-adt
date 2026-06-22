@@ -1,7 +1,7 @@
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
-import { buildObjectUrl, buildSourceUrl, getSupportedTypes, NESTED_TYPES } from '../lib/urlBuilder.js';
+import { buildClassIncludeUrl, buildObjectUrl, buildSourceUrl, getSupportedTypes, NESTED_TYPES } from '../lib/urlBuilder.js';
 import { formatError, parseAdtError } from '../lib/errors.js';
 
 const SUPPORTED = getSupportedTypes().join(', ');
@@ -136,6 +136,33 @@ export class SourceHandlers extends BaseHandler {
         }
       },
       {
+        name: 'abap_get_class_include',
+        annotations: { readOnlyHint: true },
+        description:
+          'Read source from a specific include of an ABAP class (implementations, definitions, macros, testclasses). ' +
+          'Use this for class-local implementation includes such as CCIMP behavior handler bodies, which are not standalone PROG/I includes.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: {
+              type: 'string',
+              description: 'Class name, e.g. /DSN/BP_S4FD_PD_I_ITM_MAP_HDR'
+            },
+            include_type: {
+              type: 'string',
+              description:
+                'Which class include to read. Values: ' +
+                '"implementations" = CCIMP (local classes, behavior handler bodies), ' +
+                '"definitions" = CCDEF (local type/class definitions), ' +
+                '"macros" = CCMAC, ' +
+                '"testclasses" = CCAU (ABAP Unit tests).',
+              enum: ['implementations', 'definitions', 'macros', 'testclasses']
+            }
+          },
+          required: ['name', 'include_type']
+        }
+      },
+      {
         name: 'abap_pretty_print',
         annotations: { readOnlyHint: true },
         description:
@@ -196,6 +223,7 @@ export class SourceHandlers extends BaseHandler {
       case 'abap_get_source':           return this.handleGetSource(args);
       case 'abap_set_source':           return this.handleSetSource(args);
       case 'abap_set_class_include':    return this.handleSetClassInclude(args);
+      case 'abap_get_class_include':    return this.handleGetClassInclude(args);
       case 'abap_edit_method':          return this.handleEditMethod(args);
       case 'abap_pretty_print':         return this.handlePrettyPrint(args);
       case 'abap_revisions':            return this.handleRevisions(args);
@@ -247,6 +275,21 @@ export class SourceHandlers extends BaseHandler {
         this.fail(formatError(`abap_get_source(${args.name})`, error) + typeHint);
       }
       this.fail(formatError(`abap_get_source(${args.name})`, error));
+    }
+  }
+
+  private async handleGetClassInclude(args: any): Promise<any> {
+    const { name, include_type } = args;
+    const sourceUrl = buildClassIncludeUrl(name, include_type);
+
+    try {
+      const source = await this.withSession(() =>
+        this.adtclient.getObjectSource(sourceUrl)
+      ) as string;
+
+      return this.success({ source, name, include_type });
+    } catch (error: any) {
+      this.fail(formatError(`abap_get_class_include(${name}/${include_type})`, error));
     }
   }
 
@@ -590,9 +633,8 @@ export class SourceHandlers extends BaseHandler {
 
   private async handleSetClassInclude(args: any): Promise<any> {
     const { name, include_type, source, transport } = args;
-    const encoded = name.replace(/\//g, '%2f').replace(/\$/g, '%24').toLowerCase();
-    const objectUrl = `/sap/bc/adt/oo/classes/${encoded}`;
-    const sourceUrl = `${objectUrl}/includes/${include_type}`;
+    const objectUrl = buildObjectUrl(name, 'CLAS');
+    const sourceUrl = buildClassIncludeUrl(name, include_type);
 
     let lockHandle: string | null = null;
 

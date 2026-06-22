@@ -12,6 +12,7 @@
     "test:watch": "jest --testPathPattern='__tests__/unit' --watch",
     "test:coverage": "jest --coverage",
     "build": "tsc -p tsconfig.json",
+    "deploy:azure": "scripts/deploy-azure.sh",
     "start": "node ./dist/index.js",
     "dev": "npx @modelcontextprotocol/inspector ./dist/index.js"
   },

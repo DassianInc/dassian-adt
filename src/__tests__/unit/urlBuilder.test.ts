@@ -2,6 +2,7 @@ import {
   encodeAbapName,
   buildObjectUrl,
   buildSourceUrl,
+  buildClassIncludeUrl,
   buildFunctionModuleUrl,
   buildFunctionIncludeUrl,
   buildPackageUrl,
@@ -109,11 +110,11 @@ describe('buildObjectUrl', () => {
   });
 
   it('SRVD/SRV', () => {
-    expect(buildObjectUrl('ZSRVD', 'SRVD/SRV')).toBe('/sap/bc/adt/srvd/zsrvd');
+    expect(buildObjectUrl('ZSRVD', 'SRVD/SRV')).toBe('/sap/bc/adt/ddic/srvd/sources/zsrvd');
   });
 
   it('SRVB/SVB', () => {
-    expect(buildObjectUrl('ZSRVB', 'SRVB/SVB')).toBe('/sap/bc/adt/srvb/zsrvb');
+    expect(buildObjectUrl('ZSRVB', 'SRVB/SVB')).toBe('/sap/bc/adt/businessservices/bindings/zsrvb');
   });
 
   // Enhancements
@@ -188,6 +189,22 @@ describe('buildSourceUrl', () => {
 
   it('propagates errors from buildObjectUrl', () => {
     expect(() => buildSourceUrl('', 'CLAS')).toThrow();
+  });
+});
+
+describe('buildClassIncludeUrl', () => {
+  it('builds implementations include URL for a namespaced class', () => {
+    expect(buildClassIncludeUrl('/DSN/BP_S4FD_PD_I_ITM_MAP_HDR', 'implementations'))
+      .toBe('/sap/bc/adt/oo/classes/%2fdsn%2fbp_s4fd_pd_i_itm_map_hdr/includes/implementations');
+  });
+
+  it('lowercases include type', () => {
+    expect(buildClassIncludeUrl('ZCL_TEST', 'TESTCLASSES'))
+      .toBe('/sap/bc/adt/oo/classes/zcl_test/includes/testclasses');
+  });
+
+  it('throws on missing include type', () => {
+    expect(() => buildClassIncludeUrl('ZCL_TEST', '')).toThrow('Class include type is required');
   });
 });
 
