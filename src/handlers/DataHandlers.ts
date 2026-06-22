@@ -85,8 +85,41 @@ export class DataHandlers extends BaseHandler {
       });
       return this.success({ result });
     } catch (error: any) {
-      this.fail(formatError('abap_query', error));
+      const fromMatch = String(args.sql || args.query || '').match(/\bFROM\s+([^\s,()]+)/i);
+      const hint = await this.unknownColumnHint(fromMatch?.[1], error);
+      this.fail(formatError('abap_query', error) + hint);
     }
+  }
+
+  /**
+   * When a query fails with "Unknown column name", fetch the table/view's actual field list
+   * and append it to the error — turning a dead-end error into a self-correcting one
+   * (the caller sees the real columns and retries instead of escalating to abap_run).
+   * Returns '' if the error isn't an unknown-column error, the table name is unknown, or
+   * field discovery fails. Best-effort: never throws.
+   */
+  private async unknownColumnHint(tableName: string | undefined, error: any): Promise<string> {
+    const msg = String(error?.message || '').toLowerCase();
+    if (!tableName || !msg.includes('unknown column name')) return '';
+    try {
+      const h = (this.adtclient as any).h;
+      const cols: string[] = await this.withSession(async () => {
+        const response = await h.request(`/sap/bc/adt/datapreview/freestyle`, {
+          qs: { rowNumber: 1 },
+          headers: { Accept: 'application/*', 'Content-Type': 'text/plain' },
+          method: 'POST',
+          body: `SELECT * FROM ${tableName}`
+        });
+        const parsed: any = parseQueryResponse(response.body);
+        return (parsed?.columns || []).map((c: any) => c.name).filter(Boolean);
+      });
+      if (cols.length) {
+        return ` Available columns on ${tableName.toUpperCase()}: ${cols.join(', ')}.`;
+      }
+    } catch (_) {
+      // Discovery failed (e.g. structure, cluster table, or the name itself is wrong) — no hint.
+    }
+    return '';
   }
 
   private async handleTable(args: any): Promise<any> {
@@ -119,7 +152,8 @@ export class DataHandlers extends BaseHandler {
       );
       return this.success({ result });
     } catch (error: any) {
-      this.fail(formatError(`abap_table(${args.name})`, error));
+      const hint = await this.unknownColumnHint(args.name, error);
+      this.fail(formatError(`abap_table(${args.name})`, error) + hint);
     }
   }
 }
