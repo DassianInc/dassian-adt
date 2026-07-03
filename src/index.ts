@@ -33,7 +33,7 @@ import { TraceHandlers }     from './handlers/TraceHandlers.js';
 import { DdicHandlers }      from './handlers/DdicHandlers.js';
 import { BspHandlers }       from './handlers/BspHandlers.js';
 import { resolveSystemConfigs, AuthConfig } from './lib/auth.js';
-import { logToolError, extractRawResponse } from './lib/logger.js';
+import { logToolError, extractRawResponse, recordRawHttpFailure, consumeRawHttpFailure } from './lib/logger.js';
 import { parseAdtError } from './lib/errors.js';
 import type { BaseHandler } from './handlers/BaseHandler.js';
 
@@ -120,6 +120,33 @@ interface SystemEntry {
   handlers: BaseHandler[];
 }
 
+/**
+ * Hook the ADT client's underlying axios instance to stash every failed HTTP exchange.
+ * abap-adt-api discards the original response when wrapping errors (fromError re-wraps
+ * as AdtErrorException(500, ...) with only a stringified message), so this is the only
+ * layer where the real SAP status/headers/body are still intact.
+ */
+function installRawFailureCapture(client: ADTClient): void {
+  const ax = (client as any)?.h?.httpclient?.axios;
+  if (!ax?.interceptors?.response) return;
+  ax.interceptors.response.use(undefined, (error: any) => {
+    try {
+      if (error?.response) {
+        const data = error.response.data;
+        recordRawHttpFailure({
+          url: error.config?.url,
+          method: error.config?.method,
+          status: error.response.status,
+          statusText: error.response.statusText,
+          headers: error.response.headers && { ...error.response.headers },
+          body: typeof data === 'string' ? data : data != null ? JSON.stringify(data) : undefined
+        });
+      }
+    } catch (_) { /* diagnostics must never break the request path */ }
+    return Promise.reject(error);
+  });
+}
+
 function createSystemEntry(
   auth: AuthConfig,
   elicitFn: (params: any) => Promise<{ action: string; content?: Record<string, any> }>,
@@ -128,6 +155,7 @@ function createSystemEntry(
 ): SystemEntry {
   const client = new ADTClient(auth.url, auth.user, auth.password, auth.client, auth.language);
   client.stateful = session_types.stateful;
+  installRawFailureCapture(client);
 
   const handlers: BaseHandler[] = [
     new SourceHandlers(client),
@@ -320,16 +348,21 @@ export class AbapAdtServer extends Server {
                             : info.isUpgradeMode      ? 'upgrade_mode'
                             : info.isLockNotSupported ? 'lock_not_supported'
                             :                           'internal';
-            const raw = info.httpStatus === 400 ? extractRawResponse(error) : {};
+            // Prefer the axios-layer stash (the library strips .response before errors get
+            // here, so extractRawResponse on the flattened error is a last-resort fallback).
+            const stashed = consumeRawHttpFailure();
+            const raw = stashed ?? (info.httpStatus === 400 ? extractRawResponse(error) : {});
             logToolError({
               tool: name,
               system: systemId,
               error_type: errorType,
               message: error.message || 'Unknown error',
-              http_status: info.httpStatus,
+              http_status: info.httpStatus ?? stashed?.status,
               args,
               raw_headers: raw.headers,
-              raw_body: raw.body
+              raw_body: raw.body,
+              raw_url: stashed?.url,
+              raw_status: stashed?.status
             });
             if (error instanceof McpError) throw error;
             throw new McpError(ErrorCode.InternalError, error.message || 'Unknown error');

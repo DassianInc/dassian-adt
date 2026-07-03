@@ -319,3 +319,65 @@ describe('HTTP status extracted from message string', () => {
     expect(msg.toLowerCase()).toContain('do not loop');
   });
 });
+
+describe('abap-adt-api 500-wrapper status lie', () => {
+  // fromError/fromException wrap errors they don't recognize as AdtErrorException(500, ...)
+  // with the real HTTP status only in the stringified message. Observed as the dominant
+  // prod failure mode: bare 400s carrying err=500, skipping the re-login path.
+
+  it('trusts the message status when err=500 with no response and message says 400', () => {
+    const info = parseAdtError({
+      err: 500,
+      type: 'Unknown error',
+      properties: {},
+      message: 'Error: Request failed with status code 400'
+    });
+    expect(info.httpStatus).toBe(400);
+    expect(info.isAmbiguous400).toBe(true);
+    expect(info.isSessionTimeout).toBe(true);
+  });
+
+  it('handles the no-prefix hasMessage variant (fromError line 2)', () => {
+    const info = parseAdtError({ err: 500, type: '', message: 'Request failed with status code 400' });
+    expect(info.httpStatus).toBe(400);
+    expect(info.isSessionTimeout).toBe(true);
+  });
+
+  it('trusts the message for wrapped 404s too', () => {
+    const info = parseAdtError({ err: 500, message: 'Error: Request failed with status code 404' });
+    expect(info.httpStatus).toBe(404);
+    expect(info.isNotFound).toBe(true);
+  });
+
+  it('keeps a genuine 500 as 500', () => {
+    const info = parseAdtError({ err: 500, message: 'An exception was raised' });
+    expect(info.httpStatus).toBe(500);
+    expect(info.isSessionTimeout).toBe(false);
+  });
+
+  it('keeps a wrapped 500 message as 500', () => {
+    const info = parseAdtError({ err: 500, message: 'Error: Request failed with status code 500' });
+    expect(info.httpStatus).toBe(500);
+  });
+
+  it('does not override when a real response object is present', () => {
+    const info = parseAdtError({
+      err: 500,
+      response: { status: 500 },
+      message: 'proxy said: upstream replied status code 400'
+    });
+    expect(info.httpStatus).toBe(500);
+  });
+
+  it('re-classifies our own formatted ambiguous-400 message (index.ts log path)', () => {
+    const msg = 'MCP error -32603: abap_table(VBAP) failed: HTTP 400 with no error detail. withSession already re-logged in and retried once';
+    const info = parseAdtError({ message: msg });
+    expect(info.httpStatus).toBe(400);
+    expect(info.isSessionTimeout).toBe(true);
+  });
+
+  it('re-classifies the withSession terminal re-login failure message', () => {
+    const info = parseAdtError({ message: 'MCP error -32603: Session expired and re-login failed: Request failed with status code 400' });
+    expect(info.isSessionTimeout).toBe(true);
+  });
+});

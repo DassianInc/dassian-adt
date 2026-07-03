@@ -82,6 +82,8 @@ await this.withSession(doWrite);
 
 **`AdtErrorException` field layout:** The library stores the HTTP status in `.err` (not `.response.status` — `.response` is often `undefined`). `parseAdtError` reads `error?.response?.status ?? error?.err` so both shapes are covered. Do not rely on `error?.response?.status` alone.
 
+**The `.err = 500` wrapper lie:** `fromError`/`fromException` in abap-adt-api wrap errors they don't recognize as `AdtErrorException(500, …)` — a hardcoded 500 with the real HTTP status surviving only in the stringified message (`Error: Request failed with status code 400`). This was the dominant prod failure mode (~350 errors/10 days logged as session_timeout with no retry). `parseAdtError` now trusts the status parsed from the message when the numeric status is that wrapper's 500 and there is no `.response`. The real SAP response (status/headers/body) is captured at the axios layer via an interceptor (`installRawFailureCapture` in `index.ts`) and merged into the error log as `raw_url`/`raw_status`/`raw_headers`/`raw_body`.
+
 When adding a new error condition, update `parseAdtError` first (adds detection), then `formatError` (adds the message).
 
 ### URL Construction

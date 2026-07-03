@@ -48,6 +48,8 @@ export class SourceHandlers extends BaseHandler {
         description:
           'Write ABAP source code for an object. Handles lock → write → unlock automatically. ' +
           'For objects outside $TMP, provide a transport number. ' +
+          'PREFER abap_edit_method when changing one method of an existing class — it edits surgically ' +
+          'without regenerating (and risking clobbering) the rest of the source. ' +
           'IMPORTANT: After writing source, call abap_activate to make it active.',
         inputSchema: {
           type: 'object',
@@ -82,7 +84,9 @@ export class SourceHandlers extends BaseHandler {
         description:
           'Surgically edit a single method inside an ABAP class without touching the rest of the source. ' +
           'Finds the method boundaries, does a find/replace scoped only to that method body, ' +
-          'runs a syntax check on the reconstructed class, and writes it back. ' +
+          'runs a syntax check on the reconstructed source, and writes it back. ' +
+          'Searches the main class source first, then the implementations (CCIMP) and testclasses (CCAU) includes — ' +
+          'so RAP behavior pool (BP_*) handler methods and local test methods are found automatically. ' +
           'Much safer than abap_set_source for targeted fixes — no risk of clobbering other methods. ' +
           'After success, call abap_activate to activate the change.',
         inputSchema: {
@@ -295,33 +299,58 @@ export class SourceHandlers extends BaseHandler {
 
   /**
    * Surgical method edit: find/replace scoped to a single method body,
-   * syntax-check the reconstructed class, then write back.
+   * syntax-check the reconstructed source, then write back.
+   *
+   * Methods are searched in the class main source first, then in the class includes:
+   * implementations (CCIMP) and testclasses (CCAU). RAP behavior pool (BP_*) handler
+   * methods live in CCIMP — their main source is an empty class shell, which is why a
+   * main-only search used to report "not found. Available: (empty)" for them.
    */
   private async handleEditMethod(args: any): Promise<any> {
     const { name, method, old_string, new_string, replace_all, transport } = args;
-    const sourceUrl = buildSourceUrl(name, 'CLAS');
     const objectUrl = buildObjectUrl(name, 'CLAS');
 
-    let source: string;
+    // Main source must be readable — that error is a real failure (bad name, auth, …).
+    // Includes are best-effort: absent/empty includes read as ''.
+    const containers: Array<{ key: string; sourceUrl: string; source: string }> = [];
     try {
-      source = await this.withSession(() =>
-        this.adtclient.getObjectSource(sourceUrl)
+      const mainSource = await this.withSession(() =>
+        this.adtclient.getObjectSource(buildSourceUrl(name, 'CLAS'))
       ) as string;
+      containers.push({ key: 'main', sourceUrl: buildSourceUrl(name, 'CLAS'), source: mainSource });
     } catch (error: any) {
       this.fail(formatError(`abap_edit_method(${name}) get source`, error));
     }
 
-    // Find METHOD boundaries (case-insensitive)
-    const methodEscaped = method.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/~/g, '[~]');
-    const startRe = new RegExp(`^([ \\t]*)METHOD\\s+${methodEscaped}\\s*\\.`, 'im');
-    let startMatch = startRe.exec(source!);
-    if (!startMatch) {
-      // Extract available method names from source
+    let located: { container: { key: string; sourceUrl: string; source: string }; start: number; end: number } | null = null;
+    const mainHit = locateMethod(containers[0].source, method);
+    if (mainHit) {
+      located = { container: containers[0], ...mainHit };
+    } else {
+      for (const includeType of ['implementations', 'testclasses']) {
+        const sourceUrl = buildClassIncludeUrl(name, includeType);
+        let src = '';
+        try {
+          src = await this.withSession(() => this.adtclient.getObjectSource(sourceUrl)) as string;
+        } catch (_) { /* include doesn't exist on this class */ }
+        const container = { key: includeType, sourceUrl, source: src };
+        containers.push(container);
+        if (!located && src) {
+          const hit = locateMethod(src, method);
+          if (hit) located = { container, ...hit };
+        }
+      }
+    }
+
+    if (!located) {
+      // Aggregate available method names across main + includes so the caller can self-correct
       const methodNames: string[] = [];
-      const listRe = /^\s*METHOD\s+(\S+)\s*\./gim;
-      let m: RegExpExecArray | null;
-      while ((m = listRe.exec(source!)) !== null) {
-        methodNames.push(m[1]);
+      for (const c of containers) {
+        const listRe = /^\s*METHOD\s+(\S+)\s*\./gim;
+        let m: RegExpExecArray | null;
+        while ((m = listRe.exec(c.source)) !== null) {
+          methodNames.push(c.key === 'main' ? m[1] : `${m[1]} (in ${c.key} include)`);
+        }
       }
       const methodList = methodNames.slice(0, 30).join(', ') + (methodNames.length > 30 ? ` (+${methodNames.length - 30} more)` : '');
 
@@ -332,10 +361,10 @@ export class SourceHandlers extends BaseHandler {
         50
       );
       if (sampledMethod?.trim()) {
-        const corrected = sampledMethod.trim().replace(/['"]/g, '');
-        // Verify the sampled answer actually exists
-        const verifyRe = new RegExp(`^\\s*METHOD\\s+${corrected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\.`, 'im');
-        if (verifyRe.test(source!)) {
+        // Strip quotes and any "(in xxx include)" location suffix the model may echo back
+        const corrected = sampledMethod.trim().replace(/['"]/g, '').replace(/\s*\(in \w+ include\)\s*$/i, '');
+        // Verify the sampled answer actually exists in one of the loaded containers
+        if (containers.some(c => locateMethod(c.source, corrected))) {
           args.method = corrected;
           return this.handleEditMethod(args);
         }
@@ -355,18 +384,14 @@ export class SourceHandlers extends BaseHandler {
       return this.handleEditMethod(args);
     }
 
-    const methodStart = startMatch.index;
-    // Find matching ENDMETHOD. after the METHOD line
-    const afterStart = source!.indexOf('\n', methodStart);
-    const endRe = /^\s*ENDMETHOD\s*\./im;
-    const remaining = source!.slice(afterStart);
-    const endMatch = endRe.exec(remaining);
-    if (!endMatch) {
+    if (located.end < 0) {
       this.fail(`abap_edit_method: Could not find ENDMETHOD for ${method} in ${name}.`);
     }
 
-    const methodEnd = afterStart + endMatch!.index + endMatch![0].length;
-    const methodBody = source!.slice(methodStart, methodEnd);
+    const { container, start: methodStart, end: methodEnd } = located;
+    const source = container.source;
+    const where = container.key === 'main' ? '' : ` (in ${container.key} include)`;
+    const methodBody = source.slice(methodStart, methodEnd);
 
     // Find/replace within method body
     const occurrences = methodBody.split(old_string).length - 1;
@@ -375,7 +400,9 @@ export class SourceHandlers extends BaseHandler {
       // class, just in a different method. Scan every method and report where it actually lives,
       // so the caller corrects the target instead of assuming the tool is flaky and falling back
       // to a full-class rewrite (which is how a real incident clobbered an adjacent method).
-      const otherMethods = findMethodsContaining(source!, old_string, method);
+      const otherMethods = containers.flatMap(c =>
+        findMethodsContaining(c.source, old_string, method)
+          .map(n => c.key === 'main' ? n : `${n} (in ${c.key} include)`));
       const locationHint = otherMethods.length > 0
         ? ` NOTE: that exact string IS present in METHOD ${otherMethods.join(', ')} — did you mean to edit ${otherMethods.length === 1 ? `METHOD ${otherMethods[0]}` : 'one of those'}? Re-run with the correct method.`
         : '';
@@ -412,11 +439,11 @@ export class SourceHandlers extends BaseHandler {
       ? methodBody.split(old_string).join(new_string)
       : methodBody.replace(old_string, new_string);
 
-    const newSource = source!.slice(0, methodStart) + newBody + source!.slice(methodEnd);
+    const newSource = source.slice(0, methodStart) + newBody + source.slice(methodEnd);
 
-    // Syntax check before writing
+    // Syntax check before writing — against the container we're editing (main or include)
     const syntaxResult = await this.withSession(() =>
-      this.adtclient.syntaxCheck(sourceUrl, sourceUrl, newSource)
+      this.adtclient.syntaxCheck(container.sourceUrl, container.sourceUrl, newSource)
     );
     const syntaxErrors = (syntaxResult as any[]).filter((r: any) => r.severity === 'E' || r.severity === 'A');
     if (syntaxErrors.length > 0) {
@@ -426,7 +453,7 @@ export class SourceHandlers extends BaseHandler {
 
     // Write back — lock → write → unlock in one withSession so session recovery
     // re-acquires the lock atomically with the new session cookie.
-    await this.notify(`Writing updated METHOD ${method} to ${name}…`);
+    await this.notify(`Writing updated METHOD ${method} to ${name}${where}…`);
     let lockHandle: string | null = null;
     try {
       await this.withSession(async () => {
@@ -435,7 +462,7 @@ export class SourceHandlers extends BaseHandler {
         try {
           // Transport guard: reject writes to non-$TMP objects without a transport
           args.transport = this.requireTransport(r, args.transport, name);
-          await this.adtclient.setObjectSource(sourceUrl, newSource, lockHandle!, args.transport);
+          await this.adtclient.setObjectSource(container.sourceUrl, newSource, lockHandle!, args.transport);
         } catch (err) {
           try { await this.adtclient.unLock(objectUrl, lockHandle!); } catch (_) {}
           lockHandle = null;
@@ -446,9 +473,10 @@ export class SourceHandlers extends BaseHandler {
       });
 
       return this.success({
-        message: `METHOD ${method} updated (${occurrences} replacement${occurrences > 1 ? 's' : ''}). Call abap_activate(${name}, CLAS) to activate.`,
+        message: `METHOD ${method} updated${where} (${occurrences} replacement${occurrences > 1 ? 's' : ''}). Call abap_activate(${name}, CLAS) to activate.`,
         name,
         method,
+        include: container.key === 'main' ? undefined : container.key,
         replacements: occurrences
       });
     } catch (error: any) {
@@ -798,6 +826,24 @@ export class SourceHandlers extends BaseHandler {
       this.fail(formatError(`abap_get_function_group(${args.name})`, error));
     }
   }
+}
+
+/**
+ * Locate the METHOD…ENDMETHOD block for `method` (case-insensitive) in `source`.
+ * Returns null when the METHOD statement isn't present; end = -1 when the METHOD
+ * statement exists but no ENDMETHOD follows (malformed source).
+ */
+function locateMethod(source: string, method: string): { start: number; end: number } | null {
+  const methodEscaped = method.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/~/g, '[~]');
+  const startRe = new RegExp(`^([ \\t]*)METHOD\\s+${methodEscaped}\\s*\\.`, 'im');
+  const startMatch = startRe.exec(source);
+  if (!startMatch) return null;
+  const start = startMatch.index;
+  const afterStart = source.indexOf('\n', start);
+  if (afterStart < 0) return { start, end: -1 };
+  const endMatch = /^\s*ENDMETHOD\s*\./im.exec(source.slice(afterStart));
+  if (!endMatch) return { start, end: -1 };
+  return { start, end: afterStart + endMatch.index + endMatch[0].length };
 }
 
 /**
