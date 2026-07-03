@@ -77,9 +77,18 @@ export function parseAdtError(error: any): AdtErrorInfo {
   let status: number | undefined =
     error?.response?.status ??
     (typeof error?.err === 'number' ? error.err : undefined);
+  const statusMatch = rawMessage.match(/status code (\d{3})/i) || rawMessage.match(/\bHTTP (\d{3})\b/);
+  const messageStatus = statusMatch ? Number(statusMatch[1]) : undefined;
   if (status === undefined) {
-    const statusMatch = rawMessage.match(/status code (\d{3})/i);
-    if (statusMatch) status = Number(statusMatch[1]);
+    status = messageStatus;
+  } else if (status === 500 && messageStatus !== undefined && messageStatus !== 500 && !error?.response) {
+    // abap-adt-api's fromError/fromException wrap failures they don't recognize as
+    // AdtErrorException(500, ...) — a hardcoded 500 with the real HTTP status surviving
+    // only in the message text ("Error: Request failed with status code 400"). Observed
+    // ~350×/10 days in prod: bare 400s logged as 500s, skipping the ambiguous-400
+    // re-login path entirely. When the numeric status is that wrapper's 500, there is
+    // no response object, and the message names a different status — trust the message.
+    status = messageStatus;
   }
 
   // A 400 on basic read operations (get_source, abap_table, abap_search) often means
@@ -93,6 +102,8 @@ export function parseAdtError(error: any): AdtErrorInfo {
     status === 400 &&
     (rawMessage === 'Unknown error' ||
       rawMessage.includes('status code 400') ||
+      rawMessage.includes('HTTP 400 with no error detail') || // our own formatError output, re-parsed by index.ts for log classification
+      rawMessage.includes('Session expired and re-login failed') || // withSession's terminal McpError, ditto
       rawMessage.trim() === '' ||
       rawMessage === 'Bad Request' ||
       /^Error 400:/i.test(rawMessage) ||   // AdtErrorException from simpleError: "Error 400:Bad Request"

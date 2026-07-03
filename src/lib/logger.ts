@@ -18,6 +18,51 @@ export interface ToolErrorEntry {
   /** Diagnostic-only: raw response headers + body snippet for HTTP 400s, used to fingerprint session drops vs real bad-requests. */
   raw_headers?: Record<string, unknown>;
   raw_body?: string;
+  raw_url?: string;
+  raw_status?: number;
+}
+
+/**
+ * Last failed HTTP exchange, captured at the axios layer (interceptor installed in index.ts).
+ * The abap-adt-api library discards the original response when it wraps errors, so by the
+ * time an error reaches the tool-call catch in index.ts the SAP response body is gone.
+ * This stash bridges that gap. Best-effort: with concurrent sessions a record can be
+ * misattributed to a different tool call — raw_url makes that detectable.
+ */
+export interface RawHttpFailure {
+  at: number;
+  url?: string;
+  method?: string;
+  status?: number;
+  statusText?: string;
+  headers?: Record<string, unknown>;
+  body?: string;
+}
+
+let lastRawFailure: RawHttpFailure | null = null;
+
+// Session cookies and tokens must never land in the error log — allow only headers
+// that help fingerprint the failure source (ICM vs ADT vs gateway).
+const SAFE_HEADER_RE = /^(content-type|content-length|server|sap-|x-sap-)/i;
+
+export function recordRawHttpFailure(f: Omit<RawHttpFailure, 'at' | 'headers'> & { headers?: Record<string, unknown> }): void {
+  const headers: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(f.headers ?? {})) {
+    if (SAFE_HEADER_RE.test(k)) headers[k] = v;
+  }
+  lastRawFailure = {
+    at: Date.now(),
+    ...f,
+    headers: Object.keys(headers).length ? headers : undefined,
+    body: f.body?.slice(0, 500)
+  };
+}
+
+/** Return and clear the stashed failure if it is fresh enough to belong to the current tool call. */
+export function consumeRawHttpFailure(maxAgeMs = 30000): RawHttpFailure | null {
+  const f = lastRawFailure;
+  lastRawFailure = null;
+  return f && Date.now() - f.at <= maxAgeMs ? f : null;
 }
 
 // Truncate long string fields so a call like abap_set_source (with multi-KB source)
