@@ -15,6 +15,13 @@ export type NotifyFn = (level: 'info' | 'warning' | 'error', message: string) =>
 /** Ask Claude to make a decision without interrupting the human. Returns Claude's text response. */
 export type SamplingFn = (systemPrompt: string, userMessage: string, maxTokens?: number) => Promise<string>;
 
+/**
+ * How long to wait for a server→client request (elicitation / sampling) before giving up.
+ * Kept short: on transports where these are answered a human is looking at a dialog, and on
+ * transports where they are not, every second here is dead time in front of a real error.
+ */
+const INTERACTION_TIMEOUT_MS = Number(process.env.MCP_INTERACTION_TIMEOUT_MS ?? 5000);
+
 export abstract class BaseHandler {
   /** Monotonic counter used to generate unique temp-class names in runClassrun. */
   private static runCounter = 0;
@@ -54,13 +61,47 @@ export abstract class BaseHandler {
   }
 
   /**
+   * Bound a server→client request (elicitation, sampling).
+   *
+   * Over the remote Streamable-HTTP deployment the client advertises the capability but never
+   * answers these requests, so an unbounded await blocks the whole tool call until the client's
+   * own tool timeout fires. The caller then sees "The operation timed out" instead of the
+   * actionable message the handler was about to produce. Bounding the wait lets every call site
+   * fall through to its own already-written fallback.
+   *
+   * Returns null if the client does not answer in time.
+   */
+  private async withInteractionTimeout<T>(label: string, fn: () => Promise<T>): Promise<T | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const pending = fn();
+    // The race may leave `pending` unsettled — swallow a later rejection so it is never unhandled.
+    pending.catch(() => {});
+    try {
+      return await Promise.race([
+        pending,
+        new Promise<null>(resolve => {
+          timer = setTimeout(() => {
+            console.error(`[ELICIT] ${label}: no client response in ${INTERACTION_TIMEOUT_MS}ms — continuing without it`);
+            resolve(null);
+          }, INTERACTION_TIMEOUT_MS);
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
    * Ask Claude to make a simple decision without interrupting the user.
    * Falls back to returning null if sampling is not available — callers must handle null.
    */
   protected async askClaude(systemPrompt: string, userMessage: string, maxTokens = 200): Promise<string | null> {
     if (!this._sampling) return null;
     try {
-      return await this._sampling(systemPrompt, userMessage, maxTokens);
+      return await this.withInteractionTimeout(
+        'askClaude',
+        () => this._sampling!(systemPrompt, userMessage, maxTokens)
+      );
     } catch (_) {
       return null;
     }
@@ -81,10 +122,12 @@ export abstract class BaseHandler {
           properties[key] = { type: 'string', title: key, description: value, default: value };
         }
       }
-      const result = await this._elicit({
+      const result = await this.withInteractionTimeout('confirmWithUser', () => this._elicit!({
         message,
         requestedSchema: { type: 'object' as const, properties, required: ['confirm'] }
-      });
+      }));
+      // No answer: same fallback as "elicitation unavailable" above — proceed.
+      if (!result) return true;
       if (result.action !== 'accept') return false;
       return result.content?.confirm === true;
     } catch (e: any) {
@@ -117,7 +160,8 @@ export abstract class BaseHandler {
         }
       };
       console.error(`[ELICIT] sending: ${message}`);
-      const result = await this._elicit(params);
+      const result = await this.withInteractionTimeout('elicitForm', () => this._elicit!(params));
+      if (!result) return null;
       console.error(`[ELICIT] response: action=${result.action}, content=${JSON.stringify(result.content)}`);
       if (result.action === 'accept' && result.content) {
         return result.content;
