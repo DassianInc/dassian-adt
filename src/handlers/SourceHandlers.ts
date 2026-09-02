@@ -307,22 +307,26 @@ export class SourceHandlers extends BaseHandler {
    * main-only search used to report "not found. Available: (empty)" for them.
    */
   private async handleEditMethod(args: any): Promise<any> {
-    const { name, method, old_string, new_string, replace_all, transport } = args;
+    const { name, method, replace_all, transport } = args;
+    // Normalise the caller's line endings to match the normalised source (see splitEol).
+    const old_string = normEol(args.old_string);
+    const new_string = normEol(args.new_string);
     const objectUrl = buildObjectUrl(name, 'CLAS');
 
     // Main source must be readable — that error is a real failure (bad name, auth, …).
     // Includes are best-effort: absent/empty includes read as ''.
-    const containers: Array<{ key: string; sourceUrl: string; source: string }> = [];
+    const containers: Array<{ key: string; sourceUrl: string; source: string; eol: string }> = [];
     try {
       const mainSource = await this.withSession(() =>
         this.adtclient.getObjectSource(buildSourceUrl(name, 'CLAS'))
       ) as string;
-      containers.push({ key: 'main', sourceUrl: buildSourceUrl(name, 'CLAS'), source: mainSource });
+      const main = splitEol(mainSource);
+      containers.push({ key: 'main', sourceUrl: buildSourceUrl(name, 'CLAS'), source: main.source, eol: main.eol });
     } catch (error: any) {
       this.fail(formatError(`abap_edit_method(${name}) get source`, error));
     }
 
-    let located: { container: { key: string; sourceUrl: string; source: string }; start: number; end: number } | null = null;
+    let located: { container: { key: string; sourceUrl: string; source: string; eol: string }; start: number; end: number } | null = null;
     const mainHit = locateMethod(containers[0].source, method);
     if (mainHit) {
       located = { container: containers[0], ...mainHit };
@@ -333,7 +337,8 @@ export class SourceHandlers extends BaseHandler {
         try {
           src = await this.withSession(() => this.adtclient.getObjectSource(sourceUrl)) as string;
         } catch (_) { /* include doesn't exist on this class */ }
-        const container = { key: includeType, sourceUrl, source: src };
+        const include = splitEol(src);
+        const container = { key: includeType, sourceUrl, source: include.source, eol: include.eol };
         containers.push(container);
         if (!located && src) {
           const hit = locateMethod(src, method);
@@ -393,8 +398,18 @@ export class SourceHandlers extends BaseHandler {
     const where = container.key === 'main' ? '' : ` (in ${container.key} include)`;
     const methodBody = source.slice(methodStart, methodEnd);
 
-    // Find/replace within method body
-    const occurrences = methodBody.split(old_string).length - 1;
+    // Find/replace within method body. Line endings are already normalised on both sides;
+    // if that still misses, retry ignoring per-line indentation before calling it a miss.
+    let effectiveOld = old_string;
+    let matchedLoosely = false;
+    if (methodBody.split(effectiveOld).length - 1 === 0) {
+      const loose = looseMatch(methodBody, old_string);
+      if (loose) {
+        effectiveOld = loose;
+        matchedLoosely = true;
+      }
+    }
+    const occurrences = methodBody.split(effectiveOld).length - 1;
     if (occurrences === 0) {
       // The most common cause of this is targeting the wrong method: the string exists in the
       // class, just in a different method. Scan every method and report where it actually lives,
@@ -436,10 +451,15 @@ export class SourceHandlers extends BaseHandler {
     }
 
     const newBody = replace_all
-      ? methodBody.split(old_string).join(new_string)
-      : methodBody.replace(old_string, new_string);
+      ? methodBody.split(effectiveOld).join(new_string)
+      : methodBody.replace(effectiveOld, new_string);
 
-    const newSource = source.slice(0, methodStart) + newBody + source.slice(methodEnd);
+    // Restore the container's original line endings so the write is a one-method diff rather
+    // than a whole-file reflow in the transport and version history.
+    const newSource = restoreEol(
+      source.slice(0, methodStart) + newBody + source.slice(methodEnd),
+      container.eol
+    );
 
     // Syntax check before writing — against the container we're editing (main or include)
     const syntaxResult = await this.withSession(() =>
@@ -473,7 +493,8 @@ export class SourceHandlers extends BaseHandler {
       });
 
       return this.success({
-        message: `METHOD ${method} updated${where} (${occurrences} replacement${occurrences > 1 ? 's' : ''}). Call abap_activate(${name}, CLAS) to activate.`,
+        message: `METHOD ${method} updated${where} (${occurrences} replacement${occurrences > 1 ? 's' : ''})` +
+          `${matchedLoosely ? ' — matched ignoring indentation' : ''}. Call abap_activate(${name}, CLAS) to activate.`,
         name,
         method,
         include: container.key === 'main' ? undefined : container.key,
@@ -826,6 +847,45 @@ export class SourceHandlers extends BaseHandler {
       this.fail(formatError(`abap_get_function_group(${args.name})`, error));
     }
   }
+}
+
+/**
+ * SAP returns class source with CRLF line endings. Callers compose old_string with plain LF,
+ * so any multi-line old_string fails a byte-exact match no matter how correct it looks — which
+ * is why matching and replacement run on LF-normalised text, with the original ending restored
+ * only on the way back to SAP.
+ */
+export function splitEol(raw: string): { source: string; eol: string } {
+  return { source: raw.replace(/\r\n/g, '\n'), eol: /\r\n/.test(raw) ? '\r\n' : '\n' };
+}
+
+export function normEol(s: string): string {
+  return typeof s === 'string' ? s.replace(/\r\n/g, '\n') : s;
+}
+
+export function restoreEol(source: string, eol: string): string {
+  return eol === '\r\n' ? source.replace(/\n/g, '\r\n') : source;
+}
+
+/**
+ * Second-order match: the text is present apart from leading/trailing whitespace drift on each
+ * line (re-indentation, trailing blanks — both routine in ABAP after a pretty-print). Returns
+ * the exact substring present in `body` so the caller can use it as the effective old_string.
+ *
+ * Returns null unless there is exactly one such match — an ambiguous edit stays an error rather
+ * than becoming a guess about which occurrence was meant.
+ */
+export function looseMatch(body: string, needle: string): string | null {
+  const lines = needle.split('\n').map(l => l.trim());
+  while (lines.length && lines[0] === '') lines.shift();
+  while (lines.length && lines[lines.length - 1] === '') lines.pop();
+  if (lines.length < 2) return null;
+  const esc = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // The leading [ \t]* keeps the first line's own indentation inside the match, so the
+  // replacement lands at the same indent instead of doubling it.
+  const re = new RegExp('[ \\t]*' + lines.map(esc).join('[ \\t]*\\n[ \\t]*'), 'g');
+  const matches = body.match(re);
+  return matches && matches.length === 1 ? matches[0] : null;
 }
 
 /**
