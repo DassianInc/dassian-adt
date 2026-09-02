@@ -6,3 +6,4 @@ coverage
 TEST_RESULTS*.md
 sap-systems.json
 *.zip
+docs/brainstorming
