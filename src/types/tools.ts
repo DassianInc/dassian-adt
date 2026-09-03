@@ -9,19 +9,25 @@ export interface ToolAnnotations {
   title?: string;
 }
 
+/** One JSON-Schema property. Recursive so array items and nested objects can be described. */
+export interface SchemaProperty {
+  type: string;
+  description?: string;
+  optional?: boolean;
+  enum?: string[];
+  default?: unknown;
+  items?: SchemaProperty;
+  properties?: Record<string, SchemaProperty>;
+  required?: string[];
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
   annotations?: ToolAnnotations;
   inputSchema: {
     type: string;
-    properties: Record<string, {
-      type: string;
-      description?: string;
-      optional?: boolean;
-      enum?: string[];
-      items?: { type: string };
-    }>;
+    properties: Record<string, SchemaProperty>;
     required?: string[];
   };
 }

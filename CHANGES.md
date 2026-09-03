@@ -65,6 +65,16 @@ New tool. Fetches `/objectstructure`, parses all `atom:link` hrefs for includes 
 
 The library's `runQuery()` omits `Content-Type`, causing 400 on all systems. We set `Content-Type: text/plain` and `Accept: application/*` via direct HTTP. `abap_table` detects LIKE/BETWEEN in WHERE clauses and routes through `datapreview/freestyle` instead of `tableContents` which rejects them.
 
+## DOMA / DTEL create and delete (verified on D23, 2026-09-03)
+
+Domains and data elements are XML-based ADT objects with no `/source/main`, so the REST create endpoint rejects them and `abap_create` built them through `DDIF_DOMA_PUT` / `DDIF_DTEL_PUT`. That branch read `package` and `transport` and then never used them: the object landed as an inactive CHAR 1 row with **no TADIR entry and no E071 entry**, and the success message told the caller to finish with `abap_get_source` / `abap_set_source` — which 404 for these types. A data element built this way could also never activate, because `SCRLEN1/2/3` were left at 0.
+
+`abap_create` now does the whole job in one classrun — PUT → `RS_CORR_INSERT` (TADIR + transport) → `DDIF_*_ACTIVATE` → `SELECT … WHERE as4local = 'A'` — and reports success only when the active row exists, because the DDIF FMs return `sy-subrc 0` even when activation failed. New optional args: `datatype`, `length`, `decimals`, `outputLength`, `lowercase`, `fixedValues` (DOMA) and `domain`, `labels` (DTEL). A transportable package with no transport is rejected up front instead of producing an orphan.
+
+`abap_delete` had the mirror-image defect: the generic ADT DELETE removed the DD01L/DD04L rows but left the TADIR row and the E071 entry in place (with a blank `OBJFUNC`), so the transport would fail on import while the tool reported `Deleted`. For DOMA, DTEL and TTYP it now follows the DELETE with `TR_DELETE_COMM_OBJECT_KEYS` + `TR_TADIR_INTERFACE`, re-counts both tables, and fails loudly if anything survived. `TR_TADIR_INTERFACE` is called with `TADIR`-typed variables — passing `E071`-typed fields dumps `CALL_FUNCTION_CONFLICT_TYPE` even though both are CHAR 40.
+
+Sixteen unit tests assert on the generated ABAP; an env-gated e2e test (`SAP_TEST_PACKAGE` + `SAP_TEST_TRANSPORT`) runs the full create → verify → delete → verify cycle against a live system.
+
 ## Test suite
 
 163 unit tests covering URL builder (every object type, namespace encoding, edge cases), error classification (every SAP error condition), and input validation (every tool with missing required params). Integration test scaffold for live SAP testing. E2E write-path test: create → write → syntax check → activate → delete. AI self-test prompt for exploratory fuzzing. All running on Jest with ts-jest, `npm test` in under 3 seconds.
