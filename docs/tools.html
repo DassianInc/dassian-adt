@@ -587,7 +587,7 @@
     <div class="tool-header">
       <div>
         <div class="tool-name">abap_create</div>
-        <div class="tool-desc">Create a new ABAP object. For temporary objects use <code>package=$TMP</code> — no transport needed. Supports CLAS, PROG, FUGR, DDLS, BDEF, INTF, TABL, DCLS, SRVD, SRVB, DEVC, and more.</div>
+        <div class="tool-desc">Create a new ABAP object. For temporary objects use <code>package=$TMP</code> — no transport needed. Supports CLAS, PROG, FUGR, DDLS, BDEF, INTF, TABL, DCLS, SRVD, SRVB, DEVC, and more. <code>DOMA</code> and <code>DTEL</code> are XML objects with no source: they are built, registered in TADIR and on the transport, and <em>activated</em> in one step from <code>datatype</code>/<code>length</code>/<code>decimals</code>/<code>fixedValues</code> (DOMA) or <code>domain</code>/<code>labels</code> (DTEL) — no <code>abap_set_source</code> afterwards.</div>
         <div class="badges"><span class="badge badge-write">write</span></div>
       </div>
     </div>

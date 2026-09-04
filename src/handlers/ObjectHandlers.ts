@@ -16,7 +16,10 @@ export class ObjectHandlers extends BaseHandler {
           'Create a new ABAP object. For temporary objects use package=$TMP — no transport needed. ' +
           'For permanent objects, provide both a named package and transport. ' +
           'After creation, write source with abap_set_source and activate with abap_activate. ' +
-          'BDEF (behavior definition) is supported — activation order is DDLS → BDEF → behavior pool class.',
+          'BDEF (behavior definition) is supported — activation order is DDLS → BDEF → behavior pool class. ' +
+          'DOMA and DTEL are XML objects with no source: abap_create builds, registers (TADIR + transport) and ' +
+          'ACTIVATES them in one step from datatype/length/decimals/fixedValues (DOMA) or domain/labels (DTEL) — ' +
+          'do not call abap_set_source afterwards.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -29,7 +32,35 @@ export class ObjectHandlers extends BaseHandler {
             devclass: { type: 'string', description: 'Alias for package.' },
             description: { type: 'string', description: 'Short description shown in ABAP Workbench' },
             transport: { type: 'string', description: 'Transport number. Required for non-$TMP packages.' },
-            rowType: { type: 'string', description: 'For type=TTYP only: line type (a DDIC structure or data element), e.g. /DSN/BIL_S_RET_SHARE. Required for TTYP.' }
+            rowType: { type: 'string', description: 'For type=TTYP only: line type (a DDIC structure or data element), e.g. /DSN/BIL_S_RET_SHARE. Required for TTYP.' },
+            datatype: { type: 'string', description: 'DOMA/DTEL only: built-in type, e.g. CHAR, NUMC, DEC, DATS. Default CHAR. Ignored for DTEL when domain is given.' },
+            length: { type: 'number', description: 'DOMA/DTEL only: length. Default 1.' },
+            decimals: { type: 'number', description: 'DOMA/DTEL only: decimal places. Default 0.' },
+            outputLength: { type: 'number', description: 'DOMA only: output length. Default = length.' },
+            lowercase: { type: 'boolean', description: 'DOMA only: allow lowercase. Default false.' },
+            fixedValues: {
+              type: 'array',
+              description: 'DOMA only: fixed values, e.g. [{ "value": "A", "text": "Alpha" }].',
+              items: {
+                type: 'object',
+                properties: {
+                  value: { type: 'string', description: 'Fixed value (DOMVALUE_L).' },
+                  text: { type: 'string', description: 'Short text for the value. Defaults to the value.' }
+                },
+                required: ['value']
+              }
+            },
+            domain: { type: 'string', description: 'DTEL only: domain to reference (REFKIND D). When omitted the element is a direct type from datatype/length/decimals.' },
+            labels: {
+              type: 'object',
+              description: 'DTEL only: field labels. Each defaults to the description, truncated to its length.',
+              properties: {
+                short: { type: 'string', description: 'Short label (10 chars).' },
+                medium: { type: 'string', description: 'Medium label (20 chars).' },
+                long: { type: 'string', description: 'Long label (40 chars).' },
+                heading: { type: 'string', description: 'Column heading (55 chars).' }
+              }
+            }
           },
           required: ['name', 'type', 'description']
         }
@@ -147,6 +178,295 @@ export class ObjectHandlers extends BaseHandler {
     'ENHO': 'ENHO/XHH', 'DEVC': 'DEVC/K', 'MSAG': 'MSAG/N',
     'VIEW': 'VIEW/DV',
   };
+
+  /** DDIC types built through DDIF_* FMs: XML ADT objects whose REST create/delete is incomplete. */
+  private static readonly DDIC_FM_TYPES = new Set(['DOMA', 'DTEL', 'TTYP']);
+
+  /** A classrun protocol marker is trusted only when it is the LAST non-empty line of the output. */
+  private static lastLineIs(output: string, marker: string): boolean {
+    const lines = String(output ?? '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    return lines.length > 0 && lines[lines.length - 1] === marker;
+  }
+
+  /** Escape a value for use inside an ABAP single-quoted literal. */
+  private static q(value: unknown): string {
+    return String(value ?? '').replace(/'/g, "''");
+  }
+
+  private static posInt(value: unknown, fallback: number): number {
+    const n = Number(value);
+    return Number.isInteger(n) && n > 0 ? n : fallback;
+  }
+
+  /**
+   * DOMA / DTEL are XML-based ADT objects: the REST create endpoint rejects them and there is no
+   * /source/main to write afterwards. Build them with the classic DDIF_* FMs and finish the job in
+   * one classrun: PUT -> RS_CORR_INSERT (TADIR + E071) -> ACTIVATE -> verify AS4LOCAL = 'A'.
+   *
+   * Verified on d23 2026-09-03: without RS_CORR_INSERT the object activates as an orphan with no
+   * TADIR row, and a DTEL without SCRLEN1/2/3 = 10/20/40 can never activate ("length > maximum
+   * length 0"). The FMs return sy-subrc 0 even when activation failed, hence the final SELECT.
+   */
+  private async createDdicElement(typeKey: 'DOMA' | 'DTEL', args: any): Promise<any> {
+    const q = ObjectHandlers.q;
+    const nameUpper = String(args.name).toUpperCase();
+    const pkg = String(args.package).toUpperCase();
+    const transport = String(args.transport || '').toUpperCase();
+
+    if (pkg !== '$TMP' && !transport) {
+      this.fail(
+        `abap_create(${nameUpper}): ${typeKey} in transportable package ${pkg} requires a transport. ` +
+        `Without one the object would activate with no TADIR/E071 registration (an orphan). Pass transport=<task or request>.`
+      );
+    }
+
+    const datatype = String(args.datatype || 'CHAR').toUpperCase();
+    const length = ObjectHandlers.posInt(args.length, 1);
+    const decimals = Number.isInteger(Number(args.decimals)) && Number(args.decimals) >= 0 ? Number(args.decimals) : 0;
+    const outputLength = ObjectHandlers.posInt(args.outputLength, length);
+    const desc = String(args.description || '').slice(0, 60);
+    const label = (value: unknown, max: number) => q(String(value ?? desc).slice(0, max));
+
+    let putBlock: string;
+    let activateFm: string;
+    let verifySelect: string;
+
+    if (typeKey === 'DOMA') {
+      const fixed: Array<{ value: unknown; text?: unknown }> = Array.isArray(args.fixedValues) ? args.fixedValues : [];
+      const fixedRows = fixed.map((f, i) => `
+CLEAR ls_dd07v.
+ls_dd07v-domname    = '${q(nameUpper)}'.
+ls_dd07v-ddlanguage = sy-langu.
+ls_dd07v-valpos     = '${String(i + 1).padStart(4, '0')}'.
+ls_dd07v-domvalue_l = '${q(String(f.value ?? '').toUpperCase())}'.
+ls_dd07v-ddtext     = '${q(String(f.text ?? f.value ?? '').slice(0, 60))}'.
+APPEND ls_dd07v TO lt_dd07v.`).join('\n');
+
+      putBlock = `
+DATA: ls_dd01v TYPE dd01v,
+      ls_dd07v TYPE dd07v,
+      lt_dd07v TYPE STANDARD TABLE OF dd07v WITH DEFAULT KEY.
+
+ls_dd01v-domname    = '${q(nameUpper)}'.
+ls_dd01v-ddlanguage = sy-langu.
+ls_dd01v-ddtext     = '${q(desc)}'.
+ls_dd01v-datatype   = '${q(datatype)}'.
+ls_dd01v-leng       = ${length}.
+ls_dd01v-decimals   = ${decimals}.
+ls_dd01v-outputlen  = ${outputLength}.
+ls_dd01v-lowercase  = '${args.lowercase ? 'X' : ' '}'.
+ls_dd01v-valexi     = '${fixed.length ? 'X' : ' '}'.
+${fixedRows}
+
+CALL FUNCTION 'DDIF_DOMA_PUT'
+  EXPORTING
+    name      = '${q(nameUpper)}'
+    dd01v_wa  = ls_dd01v
+  TABLES
+    dd07v_tab = lt_dd07v
+  EXCEPTIONS
+    OTHERS    = 1.
+IF sy-subrc <> 0.
+  out->write( |DDIF_DOMA_PUT failed: sy-subrc = { sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 } { sy-msgv2 }| ).
+  RETURN.
+ENDIF.`;
+      activateFm = 'DDIF_DOMA_ACTIVATE';
+      verifySelect = `SELECT SINGLE as4local FROM dd01l INTO lv_local
+  WHERE domname = '${q(nameUpper)}' AND as4local = 'A'.`;
+    } else {
+      const domain = String(args.domain || '').toUpperCase();
+      // DD04L-REFKIND (domain TYPEKIND): 'D' = Domain, blank = Direct Type Entry.
+      const typeBlock = domain
+        ? `ls_dd04v-refkind    = 'D'.
+ls_dd04v-domname    = '${q(domain)}'.`
+        : `ls_dd04v-refkind    = ' '.
+ls_dd04v-datatype   = '${q(datatype)}'.
+ls_dd04v-leng       = ${length}.
+ls_dd04v-decimals   = ${decimals}.`;
+      const labels = args.labels || {};
+
+      putBlock = `
+DATA ls_dd04v TYPE dd04v.
+
+ls_dd04v-rollname   = '${q(nameUpper)}'.
+ls_dd04v-ddlanguage = sy-langu.
+ls_dd04v-ddtext     = '${q(desc)}'.
+${typeBlock}
+ls_dd04v-reptext    = '${label(labels.heading, 55)}'.
+ls_dd04v-scrtext_s  = '${label(labels.short, 10)}'.
+ls_dd04v-scrtext_m  = '${label(labels.medium, 20)}'.
+ls_dd04v-scrtext_l  = '${label(labels.long, 40)}'.
+ls_dd04v-headlen    = 55.
+ls_dd04v-scrlen1    = 10.
+ls_dd04v-scrlen2    = 20.
+ls_dd04v-scrlen3    = 40.
+
+CALL FUNCTION 'DDIF_DTEL_PUT'
+  EXPORTING
+    name     = '${q(nameUpper)}'
+    dd04v_wa = ls_dd04v
+  EXCEPTIONS
+    OTHERS   = 1.
+IF sy-subrc <> 0.
+  out->write( |DDIF_DTEL_PUT failed: sy-subrc = { sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 } { sy-msgv2 }| ).
+  RETURN.
+ENDIF.`;
+      activateFm = 'DDIF_DTEL_ACTIVATE';
+      verifySelect = `SELECT SINGLE as4local FROM dd04l INTO lv_local
+  WHERE rollname = '${q(nameUpper)}' AND as4local = 'A'.`;
+    }
+
+    const methodBody = `
+DATA: lv_rc    TYPE sy-subrc,
+      lv_local TYPE dd01l-as4local.
+${putBlock}
+COMMIT WORK AND WAIT.
+
+CALL FUNCTION 'RS_CORR_INSERT'
+  EXPORTING
+    object              = '${q(nameUpper)}'
+    object_class        = '${typeKey}'
+    devclass            = '${q(pkg)}'
+    master_language     = sy-langu
+    mode                = 'I'
+    global_lock         = 'X'
+    korrnum             = '${q(transport)}'
+    author              = sy-uname
+    suppress_dialog     = 'X'
+  EXCEPTIONS
+    cancelled           = 1
+    permission_failure  = 2
+    unknown_objectclass = 3
+    OTHERS              = 4.
+IF sy-subrc <> 0.
+  out->write( |RS_CORR_INSERT failed: sy-subrc = { sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 } { sy-msgv2 } - ${typeKey} is written but NOT registered in TADIR/transport| ).
+  RETURN.
+ENDIF.
+COMMIT WORK AND WAIT.
+
+CALL FUNCTION '${activateFm}'
+  EXPORTING
+    name        = '${q(nameUpper)}'
+  IMPORTING
+    rc          = lv_rc
+  EXCEPTIONS
+    not_found   = 1
+    put_failure = 2
+    OTHERS      = 3.
+IF sy-subrc <> 0 OR lv_rc > 4.
+  out->write( |${activateFm} failed: sy-subrc = { sy-subrc } rc = { lv_rc }| ).
+  RETURN.
+ENDIF.
+COMMIT WORK AND WAIT.
+
+${verifySelect}
+IF sy-subrc <> 0.
+  out->write( 'ACTIVATION NOT CONFIRMED: no as4local = A row after ${activateFm} (the FM reports rc 0 even when activation fails)' ).
+  RETURN.
+ENDIF.
+out->write( 'OK' ).
+`;
+
+    let output: string;
+    try {
+      output = await this.runClassrun(methodBody, `ZCL_TMP_${typeKey}_CREATE`);
+    } catch (error: any) {
+      this.fail(formatError(`abap_create(${nameUpper})`, error));
+    }
+    if (!ObjectHandlers.lastLineIs(output, 'OK')) {
+      this.fail(`abap_create(${nameUpper}): ${output.trim() || `${typeKey} creation returned no output`}`);
+    }
+
+    const typeName = typeKey === 'DOMA' ? 'Domain' : 'Data element';
+    const where = pkg === '$TMP' ? 'local object ($TMP)' : `package ${pkg}, transport ${transport}`;
+    return this.success({
+      message:
+        `${typeName} ${nameUpper} created and ACTIVE (${where}). ` +
+        `Registered in TADIR${transport ? ' and on the transport' : ''}; active version verified in ` +
+        `${typeKey === 'DOMA' ? 'DD01L' : 'DD04L'}. No source step is needed - ${typeKey} is an XML object with no /source/main.`,
+      name: nameUpper,
+      type: typeKey,
+      package: pkg,
+      transport: transport || undefined,
+      active: true
+    });
+  }
+
+  /**
+   * The generic ADT DELETE removes the DDIC rows of DOMA/DTEL/TTYP but leaves their TADIR row and
+   * E071 transport entry behind (verified d23 2026-09-03) - a transport that then fails on import.
+   * Remove both explicitly and verify, so the success message means what it says.
+   *
+   * TR_TADIR_INTERFACE's key parameters are typed TADIR-*; passing E071-typed fields dumps
+   * CALL_FUNCTION_CONFLICT_TYPE even though both are CHAR 40.
+   */
+  private async cleanupDdicRepositoryEntries(objectType: string, nameUpper: string, transport?: string): Promise<string> {
+    const q = ObjectHandlers.q;
+    const task = String(transport || '').toUpperCase();
+    const methodBody = `
+DATA: ls_e071    TYPE e071,
+      ls_request TYPE trwbo_request,
+      lv_pgmid   TYPE tadir-pgmid,
+      lv_object  TYPE tadir-object,
+      lv_name    TYPE tadir-obj_name,
+      lv_tadir   TYPE i,
+      lv_e071    TYPE i.
+
+lv_pgmid  = 'R3TR'.
+lv_object = '${q(objectType)}'.
+lv_name   = '${q(nameUpper)}'.
+
+IF '${q(task)}' IS NOT INITIAL.
+  ls_e071-pgmid    = 'R3TR'.
+  ls_e071-object   = '${q(objectType)}'.
+  ls_e071-obj_name = '${q(nameUpper)}'.
+  ls_request-h-trkorr = '${q(task)}'.
+  CALL FUNCTION 'TR_DELETE_COMM_OBJECT_KEYS'
+    EXPORTING
+      is_e071_delete = ls_e071
+      iv_dialog_flag = ' '
+    CHANGING
+      cs_request     = ls_request
+    EXCEPTIONS
+      OTHERS         = 1.
+  IF sy-subrc <> 0.
+    out->write( |TR_DELETE_COMM_OBJECT_KEYS sy-subrc = { sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 }| ).
+  ENDIF.
+  COMMIT WORK AND WAIT.
+ENDIF.
+
+CALL FUNCTION 'TR_TADIR_INTERFACE'
+  EXPORTING
+    wi_test_modus         = ' '
+    wi_delete_tadir_entry = 'X'
+    wi_tadir_pgmid        = lv_pgmid
+    wi_tadir_object       = lv_object
+    wi_tadir_obj_name     = lv_name
+  EXCEPTIONS
+    OTHERS                = 1.
+IF sy-subrc <> 0.
+  out->write( |TR_TADIR_INTERFACE sy-subrc = { sy-subrc } ({ sy-msgid }/{ sy-msgno }) { sy-msgv1 }| ).
+ENDIF.
+COMMIT WORK AND WAIT.
+
+SELECT COUNT(*) FROM tadir INTO lv_tadir
+  WHERE pgmid = 'R3TR' AND object = '${q(objectType)}' AND obj_name = '${q(nameUpper)}'.
+" Only entries on modifiable requests/tasks are leftovers - released transports are history.
+SELECT COUNT(*) FROM e071 AS a INNER JOIN e070 AS b ON a~trkorr = b~trkorr INTO lv_e071
+  WHERE a~pgmid = 'R3TR' AND a~object = '${q(objectType)}' AND a~obj_name = '${q(nameUpper)}'
+    AND b~trstatus IN ('D', 'L').
+IF lv_tadir = 0 AND lv_e071 = 0.
+  out->write( 'CLEAN' ).
+ELSE.
+  out->write( |LEFTOVER TADIR={ lv_tadir } E071={ lv_e071 }| ).
+ENDIF.
+`;
+    try {
+      return await this.runClassrun(methodBody, `ZCL_TMP_${objectType}_CLEANUP`);
+    } catch (error: any) {
+      this.fail(formatError(`abap_delete(${nameUpper}) repository cleanup`, error));
+    }
+  }
 
   private async handleCreate(args: any): Promise<any> {
     // Accept devclass as alias for package (common SAP terminology)
@@ -283,82 +603,10 @@ ENDTRY.
       }
     }
 
-    // DOMA/DTEL: the ADT REST endpoint rejects creates with "An exception was raised"
-    // regardless of Content-Type. Use ABAP FMs (DDIF_DOMA_PUT / DDIF_DTEL_PUT) via
-    // classrun instead — more reliable and works across all S/4 releases.
+    // DOMA/DTEL: the ADT REST endpoint rejects creates, and these are XML objects with no
+    // /source/main to write afterwards. Build, register and activate them in one classrun.
     if (typeKey === 'DOMA' || typeKey === 'DTEL') {
-      const nameUpper = args.name.toUpperCase();
-      const safeDesc = (args.description || '').replace(/'/g, "''");
-      const pkg = args.package.toUpperCase();
-      const transport = (args.transport || '').toUpperCase();
-
-      let methodBody: string;
-      if (typeKey === 'DOMA') {
-        methodBody = `
-DATA ls_dd01v TYPE dd01v.
-ls_dd01v-domname  = '${nameUpper}'.
-ls_dd01v-ddtext   = '${safeDesc}'.
-ls_dd01v-datatype = 'CHAR'.
-ls_dd01v-leng     = 1.
-
-CALL FUNCTION 'DDIF_DOMA_PUT'
-  EXPORTING
-    name     = '${nameUpper}'
-    dd01v_wa = ls_dd01v
-  EXCEPTIONS
-    put_failure = 1
-    put_refused = 2
-    OTHERS      = 3.
-
-IF sy-subrc <> 0.
-  out->write( |DDIF_DOMA_PUT failed: sy-subrc = { sy-subrc }| ).
-ELSE.
-  out->write( 'OK' ).
-ENDIF.
-`;
-      } else {
-        methodBody = `
-DATA ls_dd04v TYPE dd04v.
-ls_dd04v-rollname = '${nameUpper}'.
-ls_dd04v-ddtext   = '${safeDesc}'.
-ls_dd04v-datatype = 'CHAR'.
-ls_dd04v-leng     = 1.
-
-CALL FUNCTION 'DDIF_DTEL_PUT'
-  EXPORTING
-    name     = '${nameUpper}'
-    dd04v_wa = ls_dd04v
-  EXCEPTIONS
-    put_failure = 1
-    put_refused = 2
-    OTHERS      = 3.
-
-IF sy-subrc <> 0.
-  out->write( |DDIF_DTEL_PUT failed: sy-subrc = { sy-subrc }| ).
-ELSE.
-  out->write( 'OK' ).
-ENDIF.
-`;
-      }
-
-      try {
-        const output = await this.runClassrun(methodBody, 'ZCL_TMP_DDIC_CREATE');
-        if (!output.includes('OK')) {
-          this.fail(`abap_create(${nameUpper}): ${output.trim() || 'FM returned non-zero sy-subrc'}`);
-        }
-        const typeName = typeKey === 'DOMA' ? 'Domain' : 'Data element';
-        return this.success({
-          message:
-            `${typeName} ${nameUpper} created in inactive state. ` +
-            (transport ? `Assign to transport ${transport} with transport_assign, then ` : '') +
-            `use abap_get_source / abap_set_source to set the full definition, then abap_activate.`,
-          name: nameUpper,
-          type: typeKey,
-          package: pkg
-        });
-      } catch (error: any) {
-        this.fail(formatError(`abap_create(${nameUpper})`, error));
-      }
+      return this.createDdicElement(typeKey, args);
     }
 
     // TTYP (table type): same situation as DOMA/DTEL — the ADT REST endpoint returns
@@ -574,8 +822,6 @@ out->write( 'OK' ).
         await h.request(objectUrl, { method: 'DELETE', qs });
       });
       lockHandle = null;
-
-      return this.success({ message: `Deleted ${args.type} ${args.name}` });
     } catch (error: any) {
       if (lockHandle) {
         try { await this.adtclient.unLock(objectUrl, lockHandle); } catch (_) {}
@@ -594,6 +840,26 @@ out->write( 'OK' ).
       }
       this.fail(formatError(`abap_delete(${args.name})`, error));
     }
+
+    // The ADT DELETE removes the DDIC rows of DOMA/DTEL/TTYP but leaves their TADIR row and
+    // E071 transport entry behind. Finish the job and verify before claiming success.
+    const baseType = String(args.type || '').toUpperCase().split('/')[0];
+    if (ObjectHandlers.DDIC_FM_TYPES.has(baseType)) {
+      const nameUpper = String(args.name).toUpperCase();
+      const output = await this.cleanupDdicRepositoryEntries(baseType, nameUpper, args.transport);
+      if (!ObjectHandlers.lastLineIs(output, 'CLEAN')) {
+        this.fail(
+          `abap_delete(${args.name}): the DDIC object was deleted, but its repository entries did not verify clean - ${output.trim()}. ` +
+          `A TADIR row or open-transport E071 entry for a non-existent object fails on import; remove it before releasing.`
+        );
+      }
+      return this.success({
+        message: `Deleted ${args.type} ${args.name}. TADIR row and open-transport entries removed and verified empty.`,
+        verified: { tadir: 0, e071: 0 }
+      });
+    }
+
+    return this.success({ message: `Deleted ${args.type} ${args.name}` });
   }
 
   private async handleActivate(args: any): Promise<any> {
