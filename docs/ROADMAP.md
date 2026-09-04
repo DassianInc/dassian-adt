@@ -82,6 +82,43 @@ Library: `publishServiceBinding(name, version)` / `unPublishServiceBinding(name,
 
 ---
 
+## Technical Debt
+
+### Generated ABAP lives in TypeScript strings — nothing checks it
+**Priority: Medium — no user-visible bug, but every mistake here is found the expensive way**
+
+Roughly eight places build ABAP source as template literals in TypeScript and ship it
+to SAP to run (`TransportHandlers`, `ObjectHandlers`, `RunHandlers`, all funnelling
+through `runClassrun` in `BaseHandler`). To the toolchain that ABAP is just a string:
+no syntax highlighting, no syntax check, no linting, no review-time readability. A typo
+or a wrong parameter type is invisible until it runs against a live SAP system — and in
+some cases only after it has already half-written data. The `CALL_FUNCTION_CONFLICT_TYPE`
+trap documented in `cleanupDdicRepositoryEntries` is exactly this failure mode.
+
+The fix is not to eliminate the strings. That code runs on the SAP server, so it has to
+travel as text, and TypeScript can no more check ABAP than it can check SQL. The goal is
+to **move the moment we find out we're wrong** from "we ran it against a live system" to
+"the build failed."
+
+Three options, worst to best value:
+
+1. **Syntax-check before executing.** Have `runClassrun` push the generated class through
+   SAP's syntax-check endpoint (already exposed as `abap_syntax_check`) and refuse to run
+   if it doesn't parse. Cheap and safe, but catches only typos, and still needs a live system.
+2. **Move the ABAP into real `.abap` files** read at build time instead of template literals.
+   Mostly mechanical. Buys syntax highlighting, readable diffs, and reviewable code.
+3. **Lint those files in CI** with `abaplint` — an open-source ABAP parser that runs on Node,
+   offline, no SAP connection needed.
+
+**Recommendation: 2 and 3 together.** 2 on its own is cosmetic; it is what makes 3 possible,
+and 3 is where the safety actually comes from. Skip 1 — it is redundant once 3 is in place.
+
+Already in place and worth keeping: the `q()` escaping helper stops interpolated values
+breaking out of the generated code, and the DOMA/DTEL unit tests assert on the generated
+text. The missing piece is that nothing checks whether the ABAP is valid ABAP.
+
+---
+
 ## Completed
 - Multi-system support (`sap_system_id` per tool call, `SAP_SYSTEMS_FILE`, `SAP_LANDSCAPE_URL`)
 - ABAP source CRUD (get, write, activate, delete, syntax check)
