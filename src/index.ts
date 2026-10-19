@@ -450,6 +450,40 @@ setInterval(() => {
   if (expired > 0) { console.error(`[TOKENS] Purged ${expired} expired token(s)`); saveTokensToDisk(issuedTokens); }
 }, 600_000);
 
+// ─── Runtime versions (surfaced on /health for deploy verification) ──────────
+// Read from the actually-loaded packages at startup, so /health reflects what
+// the running process resolved — not just what package.json/lock claims.
+function pkgVersion(pkg: string, resolveAs: string = pkg): string {
+  // Resolve the installed package, then walk up from its entry file to the
+  // owning package.json (matched by name). Walking is necessary because packages
+  // with an "exports" map (e.g. hono, the MCP SDK) block require(`${pkg}/package.json`).
+  // `resolveAs` lets callers resolve via an exported subpath for packages that
+  // have no root export (e.g. '@modelcontextprotocol/sdk/server/index.js').
+  try {
+    let dir = path.dirname(require.resolve(resolveAs));
+    for (let i = 0; i < 10; i++) {
+      try {
+        const j = JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf8'));
+        if (j.name === pkg) return j.version as string;
+      } catch { /* no package.json here — keep walking up */ }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch { /* not resolvable */ }
+  return 'unknown';
+}
+const APP_VERSION: string = (() => {
+  try { return require('../package.json').version as string; } catch { return 'unknown'; }
+})();
+const RUNTIME_VERSIONS = {
+  node: process.version,
+  'abap-adt-api': pkgVersion('abap-adt-api'),
+  axios: pkgVersion('axios'),
+  hono: pkgVersion('hono'),
+  '@modelcontextprotocol/sdk': pkgVersion('@modelcontextprotocol/sdk', '@modelcontextprotocol/sdk/server/index.js'),
+};
+
 function escHtml(s: string): string {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
@@ -614,9 +648,10 @@ async function runHttp() {
     if (reqUrl.pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        status: 'ok', sessions: sessions.size, authMode,
+        status: 'ok', version: APP_VERSION, sessions: sessions.size, authMode,
         systems: systemTemplates.map(t => t.id),
         defaultSystem: defaultId || systemTemplates[0]?.id,
+        versions: RUNTIME_VERSIONS,
       }));
       return;
     }
