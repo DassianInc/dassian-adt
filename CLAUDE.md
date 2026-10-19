@@ -141,6 +141,10 @@ az webapp deploy --resource-group rg-dsn-ai --name dassian-adt-mcp --src-path /t
 
 Deployment takes ~60 seconds. The App Service URL is `https://dassian-adt-mcp.azurewebsites.net`.
 
+### Entra Sign-In Gateway
+
+The App Service sits behind a Microsoft Entra ID sign-in gateway (App Service Easy Auth), so users must sign in with their Dassian account before reaching the SAP login page. It gates only `/oauth/authorize`; the MCP machine endpoints (`/`, `/health`, `/.well-known/*`, `/oauth/token`, `/oauth/register`) are excluded so MCP clients keep working. The app code is unaffected. **If you add a new machine/monitoring route, add it to the gateway's `excludedPaths`.** Full config, app registration, secret rotation, and rollback: [docs/ENTRA_GATEWAY.md](docs/ENTRA_GATEWAY.md).
+
 ### Pull the Error Log
 
 Errors are appended to `/home/LogFiles/dassian-adt-errors.jsonl` on the App Service (persistent Azure Files mount, survives redeploys). Kudu basic auth is disabled — use an ARM bearer token:
