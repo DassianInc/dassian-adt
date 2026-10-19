@@ -26,17 +26,18 @@ session and its own SAP session.
 Claude client (claude.ai connector / Claude Code)
     │   MCP OAuth handshake + streamable HTTP
     ▼
-Entra sign-in gateway  (App Service Easy Auth)   ← gates /oauth/authorize only
-    ▼
 dassian-adt-mcp  (App Service, Node 22, this server in HTTP mode)
+    │   in-app Entra gate on /oauth/authorize → Microsoft sign-in (see ENTRA_GATEWAY.md)
     │   per-user SAP session (basic auth with the user's own credentials)
     ▼
 SAP ADT endpoints  (…app.dassian.org / .dassian.azure : 44300)
 ```
 
-Two auth layers sit in front of SAP and must not be confused — the Entra gateway
-(edge sign-in) and the app's own MCP OAuth (which issues the Bearer token MCP
-clients use). [ENTRA_GATEWAY.md](ENTRA_GATEWAY.md) covers the split in detail.
+Two auth layers sit in front of SAP and must not be confused — the in-app Entra
+gate on `/oauth/authorize` (Microsoft sign-in) and the app's own MCP OAuth (which
+issues the Bearer token MCP clients use). The gate is implemented in the app, not
+Easy Auth (which was tried and abandoned). [ENTRA_GATEWAY.md](ENTRA_GATEWAY.md)
+covers it in detail.
 
 ## Auth modes
 
@@ -66,7 +67,11 @@ Application settings (Configuration → Application settings). Secrets are marke
 | `SAP_DEFAULT_SYSTEM` | `x22` | Default `sap_system_id` when a tool call omits it. |
 | `SAP_SYSTEMS` | *(secret)* | JSON array of system configs (`id`, `url`, `client`, `language`, + optional creds). Drives the login form's system list. |
 | `MCP_API_KEY` | *(secret)* | Optional. If set, a client may pass `Authorization: Bearer <key>` to use the service account instead of logging in. |
-| `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET` | *(secret)* | Entra gateway client secret — see [ENTRA_GATEWAY.md](ENTRA_GATEWAY.md). |
+| `MS_GATE_ENABLED` | `true` | Enable the in-app Entra sign-in gate — see [ENTRA_GATEWAY.md](ENTRA_GATEWAY.md). |
+| `ENTRA_TENANT_ID` | `d95719aa-…` | Dassian tenant; the gate admits only this tenant's users. |
+| `ENTRA_GATE_CLIENT_ID` | `e9bd0ad9-…` | Entra app for the gate. |
+| `MS_SESSION_SECRET` | *(secret)* | HMAC key signing the gate's `state` + `ms_session` cookie. |
+| `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET` | *(secret)* | Entra gate client secret (the gate's `ENTRA_GATE_CLIENT_SECRET` falls back to this). |
 | `SCM_DO_BUILD_DURING_DEPLOYMENT` | `false` | Deploy a prebuilt artifact; do **not** run an Oryx build. The zip must include `node_modules`. |
 | `WEBSITE_NODE_DEFAULT_VERSION` | `~22` | Node 22. |
 
@@ -123,10 +128,14 @@ claude.ai connector / a Claude Code URL entry pointing at
 the OAuth handshake:
 
 1. Client discovers `/.well-known/oauth-*`, registers, and opens `/oauth/authorize`
-   in the browser.
-2. **Entra gateway** requires a Dassian Microsoft sign-in first.
+   (with its OAuth params) in the browser.
+2. The **in-app Entra gate** requires a Dassian Microsoft sign-in first.
 3. The **SAP login page** appears — the user enters their SAP password(s).
 4. The server issues a 30-day MCP Bearer token; SAP tools work from then on.
+
+> **Always connect through the MCP client**, which supplies the OAuth params.
+> Opening `https://…/oauth/authorize` directly in a browser has no `redirect_uri`
+> and dead-ends at *"Missing or invalid redirect_uri"* — expected, not a bug.
 
 SAP password rotation needs no redeploy — each user logs in with their own
 credentials, and MCP tokens expire after 30 days.
