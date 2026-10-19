@@ -143,7 +143,7 @@ Deployment takes ~60 seconds. The App Service URL is `https://dassian-adt-mcp.az
 
 ### Entra Sign-In Gateway
 
-The App Service sits behind a Microsoft Entra ID sign-in gateway (App Service Easy Auth), so users must sign in with their Dassian account before reaching the SAP login page. It gates only `/oauth/authorize`; the MCP machine endpoints (`/`, `/health`, `/.well-known/*`, `/oauth/token`, `/oauth/register`) are excluded so MCP clients keep working. The app code is unaffected. **If you add a new machine/monitoring route, add it to the gateway's `excludedPaths`.** Full config, app registration, secret rotation, and rollback: [docs/ENTRA_GATEWAY.md](docs/ENTRA_GATEWAY.md).
+The App Service puts a Microsoft Entra sign-in in front of the SAP login page — users sign in with their Dassian account before `/oauth/authorize` shows the SAP form. It's implemented **in the app** (`src/index.ts`): the `/oauth/authorize` GET handler redirects to Entra (carrying the original OAuth query in a signed `state`), and a new `/oauth/ms-callback` route exchanges the code, checks the tenant, sets a signed `ms_session` cookie, and restores the original `/oauth/authorize?...` request. Only `/oauth/authorize` is gated; the MCP endpoints (`/`, `/health`, `/.well-known/*`, `/oauth/token`, `/oauth/register`, `/oauth/ms-callback`) stay anonymous. Feature-flagged via `MS_GATE_ENABLED` (fails open if misconfigured). **App Service Easy Auth was tried for this and abandoned — it corrupts the MCP OAuth flow on fresh logins (drops the query string).** Full config, flow, and rollback: [docs/ENTRA_GATEWAY.md](docs/ENTRA_GATEWAY.md).
 
 ### Pull the Error Log
 
