@@ -598,6 +598,17 @@ interface HttpSession {
 }
 
 async function runHttp() {
+  // Safety net: never let a single bad request take the whole server down.
+  // A throw inside the async request handler surfaces as an unhandled
+  // rejection, which by default crashes the Node process and restarts the
+  // container. Log and keep serving instead.
+  process.on('unhandledRejection', (reason) => {
+    console.error('[GUARD] Unhandled rejection — server kept alive:', reason);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('[GUARD] Uncaught exception — server kept alive:', err);
+  });
+
   const port     = parseInt(process.env.PORT || process.env.MCP_HTTP_PORT || '3000', 10);
   const mcpPath  = process.env.MCP_HTTP_PATH || '/';
   console.error(`[CONFIG] PORT=${port} MCP_HTTP_PATH=${mcpPath} MCP_AUTH_MODE=${process.env.MCP_AUTH_MODE}`);
@@ -735,6 +746,20 @@ async function runHttp() {
       const codeChallengeMethod = form.get('code_challenge_method') || undefined;
       const p = { clientId, redirectUri, state, codeChallenge, codeChallengeMethod };
 
+      // Validate redirect_uri up front. `new URL('')` throws, and because this
+      // handler is async that becomes an unhandled rejection which crashes the
+      // whole process — so any form submit lacking a valid redirect_uri (e.g.
+      // opening /oauth/authorize directly) would take the server down for
+      // everyone. Fail with a 400 instead.
+      let dest: URL;
+      try {
+        dest = new URL(redirectUri);
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(buildLoginHtml(systemTemplates, p, 'Missing or invalid redirect_uri. Start the connection from your MCP client rather than opening this page directly.'));
+        return;
+      }
+
       if (!username) {
         res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(buildLoginHtml(systemTemplates, p, 'SAP username is required.'));
@@ -764,7 +789,6 @@ async function runHttp() {
         expiresAt: Date.now() + 600_000,
       });
 
-      const dest = new URL(redirectUri);
       dest.searchParams.set('code', code);
       if (state) dest.searchParams.set('state', state);
       console.error(`[AUTH] redirect_uri=${redirectUri} state=${state ? state.slice(0,12)+'...' : 'MISSING'} callback=${dest.toString().slice(0,80)}`);
