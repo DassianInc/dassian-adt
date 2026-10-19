@@ -14,7 +14,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { ADTClient, session_types } from 'abap-adt-api';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { randomUUID, createHash } from 'crypto';
+import { randomUUID, createHash, createHmac, timingSafeEqual } from 'crypto';
 import { readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { URL } from 'url';
@@ -484,6 +484,105 @@ const RUNTIME_VERSIONS = {
   '@modelcontextprotocol/sdk': pkgVersion('@modelcontextprotocol/sdk', '@modelcontextprotocol/sdk/server/index.js'),
 };
 
+// ─── Microsoft Entra sign-in gate (in-app) ───────────────────────────────────
+//
+// Optional gate that requires a Microsoft (Dassian tenant) sign-in before the
+// SAP login form is shown. Unlike App Service Easy Auth, this is implemented in
+// the app so it preserves the MCP OAuth query string across the Entra round-trip
+// (the original /oauth/authorize?... params are carried in the signed `state`
+// and restored on callback). Only GET /oauth/authorize is gated — the machine
+// endpoints (/, /health, /.well-known, /oauth/token, /oauth/register) are never
+// touched, so the MCP handshake is unaffected.
+//
+// Enable with MS_GATE_ENABLED=true plus:
+//   ENTRA_TENANT_ID, ENTRA_GATE_CLIENT_ID,
+//   ENTRA_GATE_CLIENT_SECRET (falls back to MICROSOFT_PROVIDER_AUTHENTICATION_SECRET),
+//   MS_SESSION_SECRET (random string used to sign the session cookie + state)
+// If enabled but misconfigured, the gate fails OPEN (serves the form) and logs,
+// so a config mistake can never lock users out.
+const MS_GATE_ENABLED     = process.env.MS_GATE_ENABLED === 'true';
+const ENTRA_TENANT_ID     = process.env.ENTRA_TENANT_ID     || '';
+const ENTRA_GATE_CLIENT_ID = process.env.ENTRA_GATE_CLIENT_ID || '';
+const ENTRA_GATE_SECRET   = process.env.ENTRA_GATE_CLIENT_SECRET || process.env.MICROSOFT_PROVIDER_AUTHENTICATION_SECRET || '';
+const MS_SESSION_SECRET   = process.env.MS_SESSION_SECRET   || '';
+const MS_SESSION_TTL_MS   = parseInt(process.env.MS_SESSION_TTL_HOURS || '8', 10) * 3600 * 1000;
+const STATE_TTL_MS        = 10 * 60 * 1000;
+
+function msGateConfigured(): boolean {
+  return !!(MS_SESSION_SECRET && ENTRA_TENANT_ID && ENTRA_GATE_CLIENT_ID && ENTRA_GATE_SECRET);
+}
+
+function b64url(input: Buffer | string): string {
+  return Buffer.from(input).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function b64urlDecode(s: string): string {
+  return Buffer.from(s.replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString();
+}
+function signValue(value: string): string {
+  const mac = createHmac('sha256', MS_SESSION_SECRET).update(value).digest();
+  return value + '.' + b64url(mac);
+}
+function verifySigned(signed: string): string | null {
+  const i = signed.lastIndexOf('.');
+  if (i <= 0) return null;
+  const value = signed.slice(0, i);
+  const expected = createHmac('sha256', MS_SESSION_SECRET).update(value).digest();
+  let provided: Buffer;
+  try { provided = Buffer.from(signed.slice(i + 1).replace(/-/g,'+').replace(/_/g,'/'), 'base64'); } catch { return null; }
+  if (provided.length !== expected.length) return null;
+  return timingSafeEqual(provided, expected) ? value : null;
+}
+function parseCookies(header?: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  (header || '').split(';').forEach(pair => {
+    const idx = pair.indexOf('=');
+    if (idx > 0) out[pair.slice(0, idx).trim()] = decodeURIComponent(pair.slice(idx + 1).trim());
+  });
+  return out;
+}
+function hasValidMsSession(req: IncomingMessage): boolean {
+  const raw = parseCookies(req.headers['cookie'])['ms_session'];
+  if (!raw) return false;
+  const value = verifySigned(raw);
+  if (!value) return false;
+  const exp = parseInt(value.split(':')[0], 10);
+  return Number.isFinite(exp) && exp > Date.now();
+}
+function entraAuthorizeUrl(base: string, originalSearch: string): string {
+  const payload = b64url(JSON.stringify({ q: originalSearch, e: Date.now() + STATE_TTL_MS, n: randomUUID() }));
+  const u = new URL(`https://login.microsoftonline.com/${ENTRA_TENANT_ID}/oauth2/v2.0/authorize`);
+  u.searchParams.set('client_id', ENTRA_GATE_CLIENT_ID);
+  u.searchParams.set('response_type', 'code');
+  u.searchParams.set('redirect_uri', `${base}/oauth/ms-callback`);
+  u.searchParams.set('response_mode', 'query');
+  u.searchParams.set('scope', 'openid profile email');
+  u.searchParams.set('state', signValue(payload));
+  return u.toString();
+}
+async function exchangeEntraCode(code: string, redirectUri: string): Promise<any> {
+  const body = new URLSearchParams({
+    client_id: ENTRA_GATE_CLIENT_ID,
+    client_secret: ENTRA_GATE_SECRET,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+    scope: 'openid profile email',
+  });
+  const r = await fetch(`https://login.microsoftonline.com/${ENTRA_TENANT_ID}/oauth2/v2.0/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  if (!r.ok) throw new Error(`Entra token exchange failed (${r.status}): ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
+function decodeJwtClaims(jwt?: string): any | null {
+  if (!jwt) return null;
+  const parts = jwt.split('.');
+  if (parts.length < 2) return null;
+  try { return JSON.parse(b64urlDecode(parts[1])); } catch { return null; }
+}
+
 function escHtml(s: string): string {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
@@ -721,8 +820,58 @@ async function runHttp() {
       return;
     }
 
+    // ── Microsoft Entra gate: callback ──────────────────────────────────────
+    if (reqUrl.pathname === '/oauth/ms-callback' && req.method === 'GET') {
+      const base = `https://${req.headers.host}`;
+      const oauthErr = reqUrl.searchParams.get('error');
+      if (oauthErr) {
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<p>Microsoft sign-in failed: ${escHtml(oauthErr)} — ${escHtml(reqUrl.searchParams.get('error_description') || '')}</p>`);
+        return;
+      }
+      const stateVal = verifySigned(reqUrl.searchParams.get('state') || '');
+      if (!stateVal) { res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' }); res.end('Invalid sign-in state. Please retry from your MCP client.'); return; }
+      let st: { q: string; e: number };
+      try { st = JSON.parse(b64urlDecode(stateVal)); } catch { res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' }); res.end('Invalid sign-in state.'); return; }
+      if (!st.e || st.e < Date.now()) { res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' }); res.end('Sign-in timed out. Please retry from your MCP client.'); return; }
+
+      let claims: any;
+      try {
+        const tok = await exchangeEntraCode(reqUrl.searchParams.get('code') || '', `${base}/oauth/ms-callback`);
+        claims = decodeJwtClaims(tok.id_token);
+      } catch (e: any) {
+        console.error('[MS-GATE] token exchange failed:', e?.message || e);
+        res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' }); res.end('Microsoft sign-in could not be completed. Please retry.');
+        return;
+      }
+      if (!claims || claims.tid !== ENTRA_TENANT_ID) {
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<p>Access denied: this connector is restricted to Dassian accounts.</p>');
+        return;
+      }
+      const expiry = Date.now() + MS_SESSION_TTL_MS;
+      const cookie = `ms_session=${encodeURIComponent(signValue(`${expiry}:${claims.oid || ''}`))}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(MS_SESSION_TTL_MS / 1000)}`;
+      const dest = st.q && st.q.startsWith('?') ? `/oauth/authorize${st.q}` : '/oauth/authorize';
+      console.error(`[MS-GATE] sign-in ok tid=${claims.tid} user=${String(claims.preferred_username || claims.upn || '').slice(0,40)} -> ${dest.slice(0,70)}`);
+      res.writeHead(302, { 'Set-Cookie': cookie, 'Location': dest });
+      res.end();
+      return;
+    }
+
     // ── OAuth: show login form ──────────────────────────────────────────────
     if (reqUrl.pathname === '/oauth/authorize' && req.method === 'GET') {
+      // Microsoft Entra gate: require a Dassian sign-in before showing the SAP
+      // form. The original OAuth query is carried through Entra in `state` and
+      // restored on /oauth/ms-callback, so the MCP flow's params survive intact.
+      if (MS_GATE_ENABLED && !hasValidMsSession(req)) {
+        if (msGateConfigured()) {
+          const base = `https://${req.headers.host}`;
+          res.writeHead(302, { 'Location': entraAuthorizeUrl(base, reqUrl.search) });
+          res.end();
+          return;
+        }
+        console.error('[MS-GATE] enabled but misconfigured — serving SAP form without the Microsoft gate');
+      }
       const p = {
         clientId:            reqUrl.searchParams.get('client_id')             || '',
         redirectUri:         reqUrl.searchParams.get('redirect_uri')          || '',
