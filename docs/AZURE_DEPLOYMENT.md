@@ -99,13 +99,21 @@ Deployment takes ~60 seconds. The App Service restarts automatically.
 ```bash
 BASE="https://dassian-adt-mcp.azurewebsites.net"
 
-# Health — anonymous, lists auth mode + configured systems
+# Health — anonymous, lists auth mode, configured systems, and running versions
 curl -s "$BASE/health"
-# {"status":"ok","sessions":0,"authMode":"oauth","systems":[...],"defaultSystem":"x22"}
+# {"status":"ok","version":"2.0.0","sessions":0,"authMode":"oauth",
+#  "systems":[...],"defaultSystem":"x22",
+#  "versions":{"node":"v22...","abap-adt-api":"7.1.3","axios":"1.20.0",
+#              "hono":"4.13.13","@modelcontextprotocol/sdk":"1.32.1"}}
 
 # The login page is gated by Entra — a browser request 302s to Microsoft sign-in
 curl -s -D - -o /dev/null -H "Accept: text/html" "$BASE/oauth/authorize" | grep -i '^location:'
 ```
+
+The `version` and `versions` fields report what the **running process** actually
+loaded (app version, Node, and key dependencies), read at startup via
+`require.resolve`. Use them to confirm a deploy is live — e.g. that a dependency
+bump actually shipped — rather than inferring from `package-lock.json`.
 
 ## How users connect
 
