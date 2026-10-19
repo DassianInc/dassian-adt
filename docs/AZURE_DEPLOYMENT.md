@@ -2,260 +2,163 @@
 
 ## What This Is
 
-A Node.js server that gives AI assistants (Claude) access to SAP systems. Runs as a single process, listens on HTTP, handles multiple concurrent users — each gets their own SAP session via a browser login page. Your job: get it running, reachable by the team, reachable to SAP.
+The production deployment that claude.ai and Claude Code connect to is a single
+**Azure App Service** running this server in HTTP mode. Each user authenticates
+with their own SAP credentials through a browser login page, behind a Microsoft
+Entra sign-in gateway. One process serves all users; each gets its own MCP
+session and its own SAP session.
 
----
+| | |
+|---|---|
+| **App Service** | `dassian-adt-mcp` |
+| **URL** | `https://dassian-adt-mcp.azurewebsites.net` |
+| **Resource group** | `rg-dsn-ai` |
+| **Region** | East US 2 |
+| **OS / runtime** | Linux, Node 22 LTS (`NODE|22-lts`) |
+| **MCP endpoint** | `/` (the site root) |
+| **Health check** | `/health` (anonymous) |
+| **Auth mode** | `oauth` — per-user SAP login (see below) |
+| **Sign-in gateway** | Microsoft Entra — see [ENTRA_GATEWAY.md](ENTRA_GATEWAY.md) |
 
-## 1. VM
+## Topology
 
-**B2s** (2 vCPU, 4 GB RAM, ~$30/month). This is not compute-heavy — it proxies HTTP requests to SAP.
-
-- **OS:** Windows Server 2022 or Ubuntu 22.04 LTS (either works — Node.js is cross-platform)
-- **Disk:** 30 GB Standard SSD
-- **Region:** Same as the SAP systems (they're already on Azure)
-
----
-
-## 2. Network
-
-**Outbound to SAP (NSG egress rules, port 44300 TCP):**
-
-| Destination | Host | Purpose |
-|-------------|------|---------|
-| D23 | `d23app.dassian.org:44300` | Dev 2023 |
-| D25 | `d25app.dassian.org:44300` | Dev 2025 |
-| X22 | `x22app.dassian.org:44300` | Dev 2022 |
-| C23 | `c23app.dassian.azure:44300` | Consolidation 2023 |
-| C25 | `c25app.dassian.azure:44300` | Consolidation 2025 |
-| M25 | `m25app.dassian.org:44300` | Replatform dev |
-
-The `.dassian.azure` hosts are on the same Azure network — confirm the VM is in the same VNet or has peering. The `.dassian.org` hosts need routing through existing network paths.
-
-**Inbound (NSG ingress rule):**
-
-| Source | Port | Purpose |
-|--------|------|---------|
-| Team IP range or VPN CIDR | 3000 TCP | MCP HTTP endpoint + login page |
-
-Do NOT expose port 3000 to the public internet. Restrict to your VPN/office CIDR.
-
----
-
-## 3. Install
-
-### Windows Server
-
-```powershell
-# Install Node.js 20 — download from https://nodejs.org/ or use winget:
-winget install OpenJS.NodeJS.LTS
-
-# Install Git
-winget install Git.Git
-
-# Clone and build
-cd C:\
-git clone https://github.com/DassianInc/dassian-adt.git
-cd dassian-adt
-npm install
-npm run build
-
-# Verify
-npm test
-# Should show 165 passing tests
+```
+Claude client (claude.ai connector / Claude Code)
+    │   MCP OAuth handshake + streamable HTTP
+    ▼
+Entra sign-in gateway  (App Service Easy Auth)   ← gates /oauth/authorize only
+    ▼
+dassian-adt-mcp  (App Service, Node 22, this server in HTTP mode)
+    │   per-user SAP session (basic auth with the user's own credentials)
+    ▼
+SAP ADT endpoints  (…app.dassian.org / .dassian.azure : 44300)
 ```
 
-### Ubuntu (alternative)
+Two auth layers sit in front of SAP and must not be confused — the Entra gateway
+(edge sign-in) and the app's own MCP OAuth (which issues the Bearer token MCP
+clients use). [ENTRA_GATEWAY.md](ENTRA_GATEWAY.md) covers the split in detail.
+
+## Auth modes
+
+`MCP_AUTH_MODE` (in `src/index.ts` `runHttp()`) selects how sessions get SAP
+credentials. Production runs **`oauth`**.
+
+| Mode | Behavior |
+|------|----------|
+| `service` | All sessions share the service-account credentials from `SAP_SYSTEMS`. No login page. |
+| `oauth` *(production)* | Each user signs in at `/oauth/authorize` with their **own** SAP credentials; the server issues a 30-day MCP Bearer token bound to that session. Per-user audit trail. |
+| `hybrid` | OAuth users get their own credentials; unauthenticated callers fall back to the service account. |
+
+In `oauth` mode the `/oauth/authorize` page lists every configured system and
+asks for a password per system (the "Fill all passwords at once" box sets them
+together). The system list comes from `SAP_SYSTEMS`.
+
+## App Service configuration
+
+Application settings (Configuration → Application settings). Secrets are marked
+— never commit their values.
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `MCP_TRANSPORT` | `http` | Run the HTTP server (not stdio). |
+| `MCP_HTTP_PATH` | `/` | MCP endpoint path. Clients connect to the site root. |
+| `MCP_AUTH_MODE` | `oauth` | Per-user SAP login (see above). |
+| `SAP_DEFAULT_SYSTEM` | `x22` | Default `sap_system_id` when a tool call omits it. |
+| `SAP_SYSTEMS` | *(secret)* | JSON array of system configs (`id`, `url`, `client`, `language`, + optional creds). Drives the login form's system list. |
+| `MCP_API_KEY` | *(secret)* | Optional. If set, a client may pass `Authorization: Bearer <key>` to use the service account instead of logging in. |
+| `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET` | *(secret)* | Entra gateway client secret — see [ENTRA_GATEWAY.md](ENTRA_GATEWAY.md). |
+| `SCM_DO_BUILD_DURING_DEPLOYMENT` | `false` | Deploy a prebuilt artifact; do **not** run an Oryx build. The zip must include `node_modules`. |
+| `WEBSITE_NODE_DEFAULT_VERSION` | `~22` | Node 22. |
+
+> **`SAP_SYSTEMS` shape** — see `SystemConfig` in `src/lib/auth.ts`. Each entry
+> needs at least `id` and `url`; auth fields (`user`/`password`, `serviceKey`,
+> `oauthTokenUrl`+client creds, or `entra*`) are only needed for `service`/
+> `hybrid` fallback. In pure `oauth` mode the entries just supply the id/url/
+> client/language used to build the login form.
+
+## Deploy
+
+Deployment is a prebuilt zip pushed with `az webapp deploy`. Because
+`SCM_DO_BUILD_DURING_DEPLOYMENT=false`, build locally and include `node_modules`
+in the zip.
 
 ```bash
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs git
-
-git clone https://github.com/DassianInc/dassian-adt.git /opt/dassian-adt
-cd /opt/dassian-adt
-npm install
 npm run build
-npm test
+zip -r /tmp/dassian-adt.zip dist package.json node_modules -x "node_modules/.cache/*"
+az webapp deploy \
+  --resource-group rg-dsn-ai \
+  --name dassian-adt-mcp \
+  --src-path /tmp/dassian-adt.zip \
+  --type zip
 ```
 
----
+Deployment takes ~60 seconds. The App Service restarts automatically.
 
-## 4. Configure
-
-There are two auth modes. **Per-user auth is recommended** — each team member logs in with their own SAP credentials via a browser page.
-
-### Per-user auth (recommended)
-
-Only set `SAP_URL`. Do NOT set `SAP_USER` or `SAP_PASSWORD`. The server will show a login page to each user.
-
-**Windows** — create `C:\dassian-adt\.env`:
-```
-MCP_TRANSPORT=http
-MCP_HTTP_PORT=3000
-SAP_URL=https://d25app.dassian.org:44300
-SAP_CLIENT=100
-SAP_LANGUAGE=EN
-NODE_TLS_REJECT_UNAUTHORIZED=0
-```
-
-**Ubuntu** — create `/opt/dassian-adt/.env`:
-```
-MCP_TRANSPORT=http
-MCP_HTTP_PORT=3000
-SAP_URL=https://d25app.dassian.org:44300
-SAP_CLIENT=100
-SAP_LANGUAGE=EN
-NODE_TLS_REJECT_UNAUTHORIZED=0
-```
-
-### Shared service account (alternative)
-
-Add `SAP_USER` and `SAP_PASSWORD` to the `.env`. All users share one SAP connection. No login page. Simpler but no per-user audit trail.
-
-### Multiple SAP systems
-
-Run one instance per system on different ports. Copy the `.env` file for each:
-
-```
-# .env.d25 — port 3000
-MCP_TRANSPORT=http
-MCP_HTTP_PORT=3000
-SAP_URL=https://d25app.dassian.org:44300
-
-# .env.d23 — port 3001
-MCP_TRANSPORT=http
-MCP_HTTP_PORT=3001
-SAP_URL=https://d23app.dassian.org:44300
-```
-
----
-
-## 5. Run as a Service
-
-### Windows (NSSM)
-
-Download [NSSM](https://nssm.cc/) (Non-Sucking Service Manager) and install:
-
-```powershell
-# Install NSSM (or download from nssm.cc)
-# Then create the service:
-nssm install dassian-adt-d25 "C:\Program Files\nodejs\node.exe" "C:\dassian-adt\dist\index.js"
-nssm set dassian-adt-d25 AppDirectory "C:\dassian-adt"
-nssm set dassian-adt-d25 AppEnvironmentExtra "MCP_TRANSPORT=http" "MCP_HTTP_PORT=3000" "SAP_URL=https://d25app.dassian.org:44300" "SAP_CLIENT=100" "SAP_LANGUAGE=EN" "NODE_TLS_REJECT_UNAUTHORIZED=0"
-nssm set dassian-adt-d25 DisplayName "dassian-adt (D25)"
-nssm set dassian-adt-d25 Description "MCP server for SAP D25"
-nssm start dassian-adt-d25
-
-# For D23 on port 3001:
-nssm install dassian-adt-d23 "C:\Program Files\nodejs\node.exe" "C:\dassian-adt\dist\index.js"
-nssm set dassian-adt-d23 AppEnvironmentExtra "MCP_TRANSPORT=http" "MCP_HTTP_PORT=3001" "SAP_URL=https://d23app.dassian.org:44300" "SAP_CLIENT=100" "SAP_LANGUAGE=EN" "NODE_TLS_REJECT_UNAUTHORIZED=0"
-nssm start dassian-adt-d23
-```
-
-### Ubuntu (systemd)
-
-Create `/etc/systemd/system/dassian-adt-d25.service`:
-
-```ini
-[Unit]
-Description=dassian-adt MCP server (D25)
-After=network.target
-
-[Service]
-Type=simple
-User=dassian
-WorkingDirectory=/opt/dassian-adt
-EnvironmentFile=/opt/dassian-adt/.env.d25
-ExecStart=/usr/bin/node dist/index.js
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
+## Verify
 
 ```bash
-sudo useradd -r -s /bin/false dassian
-sudo chown -R dassian:dassian /opt/dassian-adt
-sudo systemctl daemon-reload
-sudo systemctl enable dassian-adt-d25
-sudo systemctl start dassian-adt-d25
+BASE="https://dassian-adt-mcp.azurewebsites.net"
+
+# Health — anonymous, lists auth mode, configured systems, and running versions
+curl -s "$BASE/health"
+# {"status":"ok","version":"2.0.0","sessions":0,"authMode":"oauth",
+#  "systems":[...],"defaultSystem":"x22",
+#  "versions":{"node":"v22...","abap-adt-api":"7.1.3","axios":"1.20.0",
+#              "hono":"4.13.13","@modelcontextprotocol/sdk":"1.32.1"}}
+
+# The login page is gated by Entra — a browser request 302s to Microsoft sign-in
+curl -s -D - -o /dev/null -H "Accept: text/html" "$BASE/oauth/authorize" | grep -i '^location:'
 ```
 
----
+The `version` and `versions` fields report what the **running process** actually
+loaded (app version, Node, and key dependencies), read at startup via
+`require.resolve`. Use them to confirm a deploy is live — e.g. that a dependency
+bump actually shipped — rather than inferring from `package-lock.json`.
 
-## 6. Verify
+## How users connect
+
+The server is registered as a remote MCP connector (e.g. the "Dassian ADT"
+claude.ai connector / a Claude Code URL entry pointing at
+`https://dassian-adt-mcp.azurewebsites.net`). On first use the MCP client runs
+the OAuth handshake:
+
+1. Client discovers `/.well-known/oauth-*`, registers, and opens `/oauth/authorize`
+   in the browser.
+2. **Entra gateway** requires a Dassian Microsoft sign-in first.
+3. The **SAP login page** appears — the user enters their SAP password(s).
+4. The server issues a 30-day MCP Bearer token; SAP tools work from then on.
+
+SAP password rotation needs no redeploy — each user logs in with their own
+credentials, and MCP tokens expire after 30 days.
+
+## Error logs
+
+Errors are appended to `/home/LogFiles/dassian-adt-errors.jsonl` on the App
+Service (persistent mount, survives redeploys). Kudu basic auth is disabled —
+pull with an ARM bearer token:
 
 ```bash
-# Health check (from the VM)
-curl http://localhost:3000/health
-# Returns: {"status":"ok","sessions":0,"pendingLogins":0,"authMode":"per-user"}
-
-# Health check (from your machine, through VPN)
-curl http://<vm-ip>:3000/health
-
-# Login page (open in browser)
-http://<vm-ip>:3000/login
+TOKEN=$(az account get-access-token --resource "https://management.azure.com/" --query accessToken -o tsv)
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://dassian-adt-mcp.scm.azurewebsites.net/api/vfs/LogFiles/dassian-adt-errors.jsonl"
 ```
 
----
+Each line: `{ ts, tool, system, error_type, message, http_status, args }`. See
+the "Pull the Error Log" section in [CLAUDE.md](../CLAUDE.md) for error-type
+meanings.
 
-## 7. How Users Connect
+## SAP connectivity
 
-### First time setup (one-time, ~2 minutes)
+The App Service must be able to reach the SAP ADT endpoints on port **44300**
+(hosts under `*.dassian.org` and `*.dassian.azure`). The authoritative list of
+systems and URLs lives in the `SAP_SYSTEMS` app setting; `/health` returns the
+current system ids. If SAP presents self-signed certificates, set
+`NODE_TLS_REJECT_UNAUTHORIZED=0` as an app setting.
 
-1. User adds this to their Claude Code config:
-```json
-{
-  "mcpServers": {
-    "abap-d25": {
-      "type": "url",
-      "url": "http://<vm-ip>:3000/mcp"
-    }
-  }
-}
-```
+## Self-hosting (non-App-Service)
 
-2. User starts a Claude session and calls any SAP tool
-3. Claude shows a link to the login page (or user opens `http://<vm-ip>:3000/login` directly)
-4. User enters their SAP username and password
-5. Browser shows "Connected to SAP" — they close the tab
-6. SAP tools work for the rest of the session
-
-The login page validates credentials against SAP before accepting them. If the password is wrong, the user sees the error immediately and can retry.
-
-### What to give Paul
-
-- The URL: `http://<vm-ip-or-dns>:3000/mcp` (D25)
-- The URL: `http://<vm-ip-or-dns>:3001/mcp` (D23, if running)
-- Confirm which SAP systems are reachable from the VM
-
----
-
-## 8. Maintenance
-
-**Updates:**
-```powershell
-# Windows
-cd C:\dassian-adt
-git pull
-npm install
-npm run build
-nssm restart dassian-adt-d25
-```
-
-```bash
-# Ubuntu
-cd /opt/dassian-adt
-git pull
-npm install
-npm run build
-sudo systemctl restart dassian-adt-d25
-```
-
-**Logs:**
-- Windows: `nssm status dassian-adt-d25` / check Event Viewer or configure NSSM log file
-- Ubuntu: `sudo journalctl -u dassian-adt-d25 --since "1 hour ago"`
-
-**SAP password rotation:** No server restart needed — each user logs in with their own password.
-
-**Monitoring:** The `/health` endpoint returns session count and auth mode. Point your monitoring at it.
+To run outside App Service (a VM, container, etc.), the only requirement is a
+Node 22 process running `node dist/index.js` with the same environment variables
+(`MCP_TRANSPORT=http`, `MCP_HTTP_PATH`, `MCP_AUTH_MODE`, `SAP_SYSTEMS`, …) behind
+TLS. There is no Entra gateway in that case unless you put one in front
+yourself; restrict network exposure accordingly.
