@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Watch the Dockerfile base image. npm advisories already come from
+  # GitHub's default security alerts on the lockfile; nothing watched this.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

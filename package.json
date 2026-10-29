@@ -3,6 +3,9 @@
   "version": "2.0.0",
   "description": "MCP server for SAP ABAP development via ADT API. Connect AI assistants to SAP: read, write, test, and deploy ABAP code without SAP GUI.",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=26"
+  },
   "scripts": {
     "test": "jest --testPathPattern='__tests__/unit'",
     "test:unit": "jest --testPathPattern='__tests__/unit'",
