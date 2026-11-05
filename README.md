@@ -100,6 +100,18 @@ Multiple systems? Add one entry per system:
 }
 ```
 
+### Testing local changes
+
+To try changes to the server before pushing them, point Claude Code at your own build through `run-local.sh`. The script starts `dist/index.js` from the repo folder, so the server reads SAP credentials from the repo's `.env` (copy `.env.example`). The `.env` file is gitignored, so credentials stay out of git and out of `~/.claude.json`.
+
+```bash
+cp .env.example .env   # then fill in your SAP details
+npm run build          # rebuild after each change
+claude mcp add abap-local -- /path/to/dassian-adt/run-local.sh
+```
+
+Restart Claude Code after each rebuild to pick up the new code.
+
 ### HTTP Mode (Team Deployment)
 
 For team-wide access, run the server as a centralized HTTP service:
